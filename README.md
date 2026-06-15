@@ -1,147 +1,218 @@
-# Personal Trading Agent — System Overview
+# Claude Trading Agent
 
-A daily-driver agent that scans ~540 US stocks for breakout setups, reasons over them with 5 specialist Claude agents, analyzes the user's household portfolio, and produces specific trade recommendations with sizing and sequencing — all while respecting individualized rules (locked positions, concentration caps, options sequencing, trade-eligible accounts only).
+A personal momentum-trading agent that scans ~540 US stocks daily, reasons over them with **5 specialist Claude agents**, analyzes your household portfolio across multiple brokerage accounts, and produces specific BUY / ADD / HOLD / TRIM / EXIT / AVOID recommendations with position-sizing guidance.
+
+Built for **swing / position traders** who want a daily forward-looking watchlist plus disciplined rebalance advice on what they already hold — not a day-trading platform.
+
+> ⚠️ This is a personal research tool, not financial advice. It generates ranked recommendations with rationale; **you make every trade decision yourself**, and you execute manually with your broker.
+
+---
+
+## What it does
+
+### 1. Identifies tomorrow's leaders today (forward-looking scanner)
+
+Scans S&P 500 + Nasdaq 100 + a curated mid-cap momentum list daily. Ranks each name by a composite of:
+- **Clean base** — ATR contraction, proximity to 52-week high
+- **RS strength** — IBD-style cross-sectional rank + RS line trajectory
+- **Trend regime** — Stage 2 confirmation, EMA stacking, 50-EMA slope health
+- **Pre-breakout proximity** — how close to triggering an actual signal
+- **Volume signature** — accumulation / volume-dry-up patterns
+
+Outputs a daily top-30 watchlist sorted by setup quality.
+
+### 2. Reasons with 5 specialist Claude agents per candidate
+
+Each agent receives **different inputs** so they don't converge to the same answer:
+
+| Agent | Sees only | Asks |
+|---|---|---|
+| **Technical** | Chart features, EMAs, signals, RS line, ATR | "Is this chart constructive?" |
+| **Fundamental** | Earnings proximity, sector RS, RS rank | "Is the catalyst environment favorable?" |
+| **Sentiment** | Volume signatures, accumulation pattern, extension | "Are institutions buying?" |
+| **Risk** | Portfolio context (concentration, account, holdings) | "What breaks this for this user?" |
+| **Portfolio Manager** | The 4 reports + position context | **Final action + sizing** |
+
+Uses Claude Opus 4.7 with adaptive thinking + prompt caching. Structured output via Pydantic so every response is guaranteed to fit the schema. Cost: ~$0.025 per ticker, ~$0.75 for a 30-name watchlist run.
+
+### 3. Tracks your portfolio across multiple accounts
+
+Parses Fidelity statements (PDF), transaction history (CSV), and live screenshots. Tracks margin debt + daily interest accrual + active short-option positions + cost basis + realized/unrealized P&L. Supports tax-advantaged (Roth, 401k, HSA) and taxable (Individual, TOD) accounts with different recommendation behavior in each.
+
+### 4. Generates rebalance recommendations honoring user-defined rules
+
+Configurable per user via `user_config.py`:
+- **Locked positions** — tickers the agent must never recommend selling (employer stock, etc.)
+- **Concentration cap** — max % of household value per position (default 10%, locked exempt)
+- **Trade-eligible accounts** — only recommend actions in accounts where trading is allowed
+- **Options sequencing** — for stocks with open short calls, always close options first before recommending share sales
+- **Earnings cadence** — earnings come quarterly; "unknown earnings dates" are not a risk
+- **Filter integrity** — 30 pinned regression-test winning signals must always continue to fire
+
+---
+
+## How it works (architecture)
+
+```
+                              ┌───────────────────────────────────┐
+                              │  user_config.py (gitignored)      │
+                              │  - your holdings + cost basis     │
+                              │  - account IDs + rules            │
+                              │  - margin status                  │
+                              │  - personal watchlist             │
+                              └─────────────┬─────────────────────┘
+                                            │ imported by
+              ┌─────────────┬───────────────┴─┬─────────────────┐
+              ▼             ▼                 ▼                 ▼
+       ┌──────────┐  ┌──────────────┐  ┌─────────────┐  ┌─────────────┐
+       │ scanner  │  │ portfolio    │  │ multi_agent │  │ dashboard   │
+       │ (wide    │  │ rebalance    │  │ (5 Claude   │  │ (Streamlit) │
+       │ universe)│  │ rules engine │  │ specialists)│  │             │
+       └────┬─────┘  └──────┬───────┘  └──────┬──────┘  └──────┬──────┘
+            │               │                  │                │
+            └───────────────┴──────────────────┴────────────────┘
+                                            │
+                                            ▼
+                                  data/snapshots/<date>/
+                                  ├── watchlist.parquet
+                                  ├── judgments_portfolio.jsonl
+                                  ├── judgments.jsonl
+                                  └── manifest.json
+                                  (versioned daily archive)
+```
+
+**Framework code is generic.** All user-specific data lives in `user_config.py` (gitignored). Anyone can fork this repo and run it on their own portfolio.
 
 ---
 
 ## Setup (new user)
 
 ```sh
-git clone <repo>
-cd stocktrading
+# 1. Clone and install
+git clone https://github.com/hakunamohata/claude-trading-agent
+cd claude-trading-agent
 pip install -r requirements.txt
 
-# Copy the user-config template and fill in your own holdings + account IDs + rules
+# 2. Set up your config
 cp user_config.example.py user_config.py
-# edit user_config.py — see comments in the file
+# edit user_config.py — see comments in the file for each field
+# Fill in your account IDs, holdings, rules, watchlist
 
-# Put your Anthropic API key in .env
+# 3. Set up Anthropic API key
 cp .env.example .env
-# edit .env — paste your API key from console.anthropic.com
+# edit .env — paste your API key from https://console.anthropic.com/settings/keys
 
-# Run regression test to verify framework is working
-python regression_test.py
+# 4. Verify the framework is working
+python regression_test.py     # should print: Passed: 30/30
 ```
 
-Once `user_config.py` and `.env` are filled in, all scripts (`scanner.py`, `portfolio_judge.py`, `dashboard.py`, etc.) read your personal data from `user_config.py`. The framework code itself contains no personal financial data.
+## Daily usage
 
-**What's user-specific (lives in `user_config.py`, gitignored):**
-- Account IDs and labels
-- Your holdings (with cost basis)
-- Margin status snapshot
-- Trade-eligible accounts, locked positions, max-position-pct
-- Watchlist + extra portfolio tickers + sector overrides
+```sh
+# Pre-market or after-close routine:
+python refresh.py                    # refresh OHLCV data (~30 sec)
+python scanner.py                    # build today's top-30 watchlist (~30 sec)
+python watchlist_judge.py --top 10   # multi-agent on top 10 (~$0.25 in API)
+python portfolio_judge.py            # multi-agent on your holdings (~$0.70 in API)
 
-**What's framework (committed, generic):**
-- All scanner, indicator, scoring, multi-agent logic
-- S&P 500 + Nasdaq 100 universe
-- 4 breakout filter modes, 9/21 SMA cloud, RS rank computation
-- Dashboard UI
-- Statement / CSV parsers
+# Then view results:
+streamlit run dashboard.py           # opens browser at localhost:8501
+```
 
----
-
-## What it does
-
-**1. Identifies tomorrow's leaders today.**
-Scanner runs across S&P 500 + Nasdaq 100 + curated momentum names. Ranks each by a composite of *clean base*, *RS strength*, *trend regime*, *pre-breakout proximity*, and *volume signature*. Outputs a daily top-30 watchlist.
-
-**2. Reasons with 5 Claude agents (Opus 4.7) per name.**
-Each agent sees **different** inputs to avoid convergence:
-- **Technical** — only chart features, EMAs, signals, RS line
-- **Fundamental** — only earnings + sector + RS
-- **Sentiment** — only price action + volume signatures
-- **Risk** — only portfolio context (concentration, account type)
-- **Portfolio Manager** — synthesizes the four reports into final BUY/ADD/HOLD/TRIM/EXIT/AVOID + position sizing guidance
-
-**3. Tracks the user's full household portfolio across 6 Fidelity accounts.**
-401k BrokerageLink, Roth IRA, HSA, Individual TOD, Individual margin (MSFT), 529. Parses statements + CSV transactions + live screenshots. Tracks margin debt, daily interest accrual, active covered-call positions, cost basis, P&L.
-
-**4. Generates rebalance recommendations honoring 7 hard rules.**
-- MSFT is locked (employer concentration accepted by user)
-- 10% max position size, % of total household
-- Trade-eligible accounts only = Roth IRA + 401k BrokerageLink
-- Close short options BEFORE selling underlying shares (sequence + cost)
-- Earnings cadence is predictable (quarterly) — unknown earnings are not a risk
-- Existing breakout filter wins (30 pinned regressions) never get lost in edits
-- Forward-looking — focus on pre-breakout candidates, not just reactive signals
+The dashboard has 4 pages:
+- **My Portfolio** — holdings, rebalance actions, sector breakdown, Claude scores per position
+- **Today's Brief** — names that fired signals today, near-misses setting up, watchlist
+- **Chart Browser** — pick any ticker, see candles with EMAs + 9/21 SMA cloud + signal markers
+- **Backtest Explorer** — historical signal performance, hit rate per mode
 
 ---
 
-## How to use it daily
+## What it doesn't do (deliberately)
 
-| When | Command | What you get |
+| Capability | Why not |
+|---|---|
+| Place trades automatically | Out of scope. You execute manually on your broker. |
+| Day-trade / intraday signals | Designed for swing/position trades on end-of-day data |
+| Real-time alerts / push notifications | Could be added (Telegram bot, etc.) — not yet built |
+| Tax-loss harvesting automation | Surfaces the opportunity, doesn't auto-execute |
+| Options strategies (Time Flies, etc.) | Stock-focused for now |
+| News / catalyst hunting via web search | Would add Anthropic web search / Exa / Tavily; not yet built |
+| Broker API integration | No retail API for most brokers; positions are updated by editing `user_config.py` |
+
+---
+
+## Key files
+
+| File | Purpose |
+|---|---|
+| `breakout.py` | Indicators + 4 signal modes (VCP, MOM, EME, PP) + 9/21 SMA cloud + RS rank |
+| `scanner.py` | Daily multi-dimensional scanner → top-30 watchlist |
+| `multi_agent.py` | 5-agent specialist judgment (Technical / Fundamental / Sentiment / Risk + PM) |
+| `judgment.py` | Single-agent Claude scoring (simpler/cheaper alternative) |
+| `portfolio.py` | Statement / CSV parser, margin status, position-action rules engine |
+| `portfolio_judge.py` | Run multi-agent on all your held positions |
+| `watchlist_judge.py` | Run multi-agent on the scanner's top watchlist |
+| `dashboard.py` | Streamlit UI (4 pages) |
+| `wide_universe.py` | Wikipedia scraper for S&P 500 + Nasdaq 100 with cached fallback |
+| `snapshot.py` | Versioned daily archive manager |
+| `sector.py` | Sector ETF strength computation |
+| `earnings.py` | Next-earnings calendar (confirmed or estimated from last + 90d cycle) |
+| `regression_test.py` | 30 pinned winning signals — runs after every change |
+| `data_fetch.py` | yfinance OHLCV wrapper + parquet cache |
+| `user_config.example.py` | Template for personal config (copy → `user_config.py`) |
+
+## Signal modes
+
+| Mode | Trigger | Catches |
 |---|---|---|
-| Morning, pre-market | `python refresh.py` | Latest OHLCV across universe, cached |
-| Morning | `python scanner.py` | Top-30 watchlist written to today's snapshot |
-| Morning | `python watchlist_judge.py --top 10` | Multi-agent runs on top 10 watchlist (~$0.25 in API calls) |
-| Anytime | `python portfolio_judge.py` | Multi-agent on all 27 non-MSFT held positions (~$0.70) |
-| In browser | `streamlit run dashboard.py` → localhost:8501 | Visual: Portfolio page, Chart Browser with signals, Backtest Explorer, Today's Brief |
-| After any code change | `python regression_test.py` | Asserts 30 known winning signals still fire |
+| **VCP** (Volatility Contraction Pattern) | Quiet base + volume surge + price > prior 50d high | Classical Minervini-style breakouts |
+| **MOM** (Trend Continuation) | Stage 2 + elite RS + 20-day high breakout | Names already in strong uptrends |
+| **EME** (Stage-2 Emergence) | Close reclaims 200 EMA + golden cross + volume | Start of new uptrends |
+| **PP** (Pocket Pivot) | Up-day with volume > max down-day volume of prior 10d | Institutional buying inside bases |
+
+Each mode is independently regression-tested against historically winning signals to ensure changes don't regress.
 
 ---
 
-## The 4 phases delivered (per Amit's playbook)
+## Cost
 
-| Phase | Module | What it does |
-|---|---|---|
-| 1 — Scanner | `scanner.py`, `wide_universe.py` | Pre-breakout candidate generation across 537 names |
-| 2 — Multi-agent | `multi_agent.py`, `portfolio_judge.py` | 4 specialist agents + PM, structured Pydantic output, prompt caching |
-| 3 — Indicators | `breakout.py` | 4 breakout modes (VCP/MOM/EME/PP), 9/21 SMA cloud, RS rank, RS line, sector strength |
-| 4 — Snapshot + git | `snapshot.py`, `data/snapshots/<date>/` | Versioned daily archives so "run for a month, then ask agent to improve" actually works |
+API calls run on **Claude Opus 4.7** with adaptive thinking + prompt caching. Typical daily run:
 
----
+- Multi-agent on portfolio (~30 positions): **~$0.70**
+- Multi-agent on watchlist (top 10): **~$0.25**
+- Combined daily cost: **~$1/day** running every weekday → **~$22/month**
 
-## What this system does NOT do (yet, deferred)
-
-- Place trades (you execute on Fidelity manually)
-- Options strategies (Time Flies Spread, MSFT covered-call income to offset margin interest — deferred)
-- News / catalyst hunting via web search (dexter-style research agent)
-- Tax-loss harvesting automation
-- Real-time alerts (push notifications when a signal fires)
+Cheaper option: switch `ANTHROPIC_MODEL` in `.env` to `claude-haiku-4-5` for ~5× cost reduction with some quality tradeoff.
 
 ---
 
-## Files at a glance
+## Privacy
 
-```
-data_fetch.py      OHLCV fetch + parquet cache
-breakout.py        Indicators + 4 signal modes + EMA cloud + RS rank
-sector.py          Sector ETF strength tagging
-earnings.py        Next-earnings date (confirmed or estimated last+90d)
-wide_universe.py   ~540-name universe (S&P 500 + Nasdaq 100 + curated)
-universe.py        Small universe + sector mapping + portfolio holdings list
-scanner.py         Daily pre-breakout scanner → top-30 watchlist
-judgment.py        Single-agent Claude scoring
-multi_agent.py     5-agent specialist judgment (Technical/Fundamental/Sentiment/Risk + PM)
-portfolio.py       Statement + CSV parser, margin status, position-action rules
-portfolio_judge.py Multi-agent run on all held positions
-score_portfolio.py Single-agent run on all held positions
-watchlist_judge.py Multi-agent run on scanner watchlist
-snapshot.py        Daily versioned archive manager
-dashboard.py       Streamlit UI (Portfolio, Today's Brief, Chart Browser, Backtest)
-regression_test.py 30 pinned winning signals — runs after every change
-refresh.py         Force-refresh OHLCV
-scan.py            Lightweight daily scan (small universe)
-backtest.py        Historical filter back-test
-diagnose_targets.py Per-ticker forward-return diagnostic
-
-data/
-  ├── <TICKER>.parquet   cached OHLCV
-  ├── universe/          Wikipedia scrapes (S&P 500, Nasdaq 100)
-  ├── earnings.parquet   earnings calendar cache
-  ├── scans/             legacy daily scan output
-  ├── snapshots/<date>/  versioned daily archives
-  │   ├── manifest.json
-  │   ├── watchlist.parquet
-  │   ├── judgments_portfolio.jsonl
-  │   └── ...
-  └── judgments/         Claude single-agent cache
-holdings/                Fidelity statements + screenshots + parsed positions
-```
+- **Your financial data never leaves your machine.** All holdings + rules + analysis run locally.
+- `user_config.py` is gitignored. So is `.env`, `holdings/`, `data/snapshots/`, `data/judgments/`, and all cached OHLCV.
+- The public repo contains zero personal financial information — only framework code.
+- API requests to Anthropic include the structured payloads (ticker + indicators + position size in $) but not account numbers, names, or anything personally identifying.
 
 ---
 
-## Current state
+## Background
 
-See `data/snapshots/<today>/` for the latest scan + multi-agent judgments. The dashboard's Portfolio page shows a live view from `user_config.py`.
+Built iteratively over a single session with the help of [Claude Code](https://claude.ai/code). The architecture takes inspiration from:
+
+- [virattt/ai-hedge-fund](https://github.com/virattt/ai-hedge-fund) — multi-agent investor philosophy idea, simplified here to 4 functional specialists + a Portfolio Manager
+- Mark Minervini's Volatility Contraction Pattern + Pocket Pivot mechanics
+- Stan Weinstein's Stage 2 / Stage 4 trend framework
+- IBD-style cross-sectional Relative Strength ranking
+- William O'Neil's CAN SLIM principles (the "leadership" emphasis)
+
+---
+
+## License
+
+MIT. See LICENSE (or treat as MIT until a file is added).
+
+---
+
+## Disclaimer
+
+This software is for educational and personal research use only. It does not constitute financial, investment, tax, or legal advice. **Past signal performance does not predict future results.** Trade at your own risk. The author and contributors accept no liability for any losses incurred from using this software or acting on its recommendations.
