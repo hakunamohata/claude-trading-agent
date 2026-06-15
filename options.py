@@ -188,20 +188,50 @@ def price_user_options() -> pd.DataFrame:
     if not positions:
         return pd.DataFrame()
 
+    # Normalize each position to a dict (legacy 7-tuple format → dict)
+    normalized: list[dict] = []
+    for pos in positions:
+        if isinstance(pos, dict):
+            normalized.append({
+                "account_id": pos["account_id"],
+                "ticker": pos["ticker"],
+                "strike": pos["strike"],
+                "expiry": pos["expiry"],
+                "opt_type": pos["opt_type"],
+                "contracts": pos["contracts"],
+                "premium_per_share_avg": pos["premium_per_share_avg"],
+                "is_roll": pos.get("is_roll", False),
+                "cumulative_realized_usd": pos.get("cumulative_realized_usd", 0.0),
+            })
+        elif isinstance(pos, (list, tuple)) and len(pos) == 7:
+            normalized.append({
+                "account_id": pos[0], "ticker": pos[1], "strike": pos[2],
+                "expiry": pos[3], "opt_type": pos[4], "contracts": pos[5],
+                "premium_per_share_avg": pos[6],
+                "is_roll": False, "cumulative_realized_usd": 0.0,
+            })
+
     # Compute total contracts written per ticker (for covered/naked detection)
     contracts_by_ticker: dict[str, int] = {}
-    for pos in positions:
-        if len(pos) == 7 and pos[5] < 0:  # short call/put
-            contracts_by_ticker[pos[1]] = contracts_by_ticker.get(pos[1], 0) + abs(pos[5])
+    for pos in normalized:
+        if pos["contracts"] < 0:
+            contracts_by_ticker[pos["ticker"]] = (
+                contracts_by_ticker.get(pos["ticker"], 0) + abs(pos["contracts"])
+            )
 
     today = pd.Timestamp(date.today())
     rows = []
 
-    for pos in positions:
-        if len(pos) == 7:
-            acct, ticker, strike, expiry, opt_type, contracts, premium_per_contract = pos
-        else:
-            continue
+    for pos in normalized:
+        acct = pos["account_id"]
+        ticker = pos["ticker"]
+        strike = pos["strike"]
+        expiry = pos["expiry"]
+        opt_type = pos["opt_type"]
+        contracts = pos["contracts"]
+        premium_per_contract = pos["premium_per_share_avg"]
+        is_roll = pos["is_roll"]
+        cumulative_realized = pos["cumulative_realized_usd"]
 
         expiry_ts = pd.Timestamp(expiry)
         dte = max(0, (expiry_ts - today).days)
@@ -250,6 +280,9 @@ def price_user_options() -> pd.DataFrame:
                 shortage = shares_needed - shares_held
                 coverage = f"NAKED ({int(shortage)} sh short)"
 
+        # Cumulative net P&L = current contract P&L + realized P&L from prior rolls
+        cumulative_pnl = total_pnl + cumulative_realized
+
         rows.append({
             "account": acct,
             "ticker": ticker,
@@ -259,19 +292,22 @@ def price_user_options() -> pd.DataFrame:
             "type": opt_type.upper(),
             "side": "SHORT" if is_short else "LONG",
             "coverage": coverage,
+            "rolled": "ROLL" if is_roll else "fresh",
             "contracts": int(n_abs),
             "spot": round(spot, 2),
             "moneyness_pct": round((spot / strike - 1) * 100, 1),
             "current_mid": round(current_mid, 2),
             "iv": round(iv * 100, 1),
             "premium_per_contract": round(premium_per_contract, 2),
-            "total_pnl_usd": round(total_pnl, 0),
+            "current_contract_pnl_usd": round(total_pnl, 0),
+            "prior_rolls_realized_usd": round(cumulative_realized, 0),
+            "cumulative_trade_pnl_usd": round(cumulative_pnl, 0),
             "pnl_pct_of_premium": round(pnl_per_contract / premium_per_contract * 100, 0)
                 if premium_per_contract else None,
             "delta": round(greeks["delta"], 3),
             "gamma": round(greeks["gamma"], 4),
-            "theta_per_day": round(greeks["theta"] * 100 * n_abs, 0),  # $ per day total
-            "vega": round(greeks["vega"] * 100 * n_abs, 0),            # $ per 1% IV move
+            "theta_per_day": round(greeks["theta"] * 100 * n_abs, 0),
+            "vega": round(greeks["vega"] * 100 * n_abs, 0),
         })
 
     return pd.DataFrame(rows)
@@ -295,8 +331,10 @@ if __name__ == "__main__":
     else:
         print(df.to_string(index=False))
         print()
-        total_pnl = df["total_pnl_usd"].sum()
+        current_pnl = df["current_contract_pnl_usd"].sum()
+        cumulative_pnl = df["cumulative_trade_pnl_usd"].sum()
         total_theta = df["theta_per_day"].sum()
-        print(f"Total open P&L: ${total_pnl:,.0f}")
-        print(f"Total theta (daily decay you collect on shorts): ${-total_theta:,.0f}/day"
-              if total_theta < 0 else f"Total theta: ${total_theta:,.0f}/day")
+        print(f"Current contract open P&L:          ${current_pnl:,.0f}")
+        print(f"Cumulative net (incl. prior rolls): ${cumulative_pnl:,.0f}")
+        print(f"Theta (daily decay collected):      ${-total_theta:,.0f}/day"
+              if total_theta < 0 else f"Theta: ${total_theta:,.0f}/day")
