@@ -11,6 +11,14 @@ data/scans/
 data/judgments/
 # data/snapshots/ contains portfolio judgments with cost basis — never commit
 data/snapshots/
+# data/research/ contains per-ticker web research output (could be tied to user's portfolio)
+data/research/
+# data/news/ contains per-ticker headline summaries (could leak which names user owns)
+data/news/
+# data/options/ daily option chain snapshots (could leak holdings)
+data/options/
+# data/multi_agent/ cached judgment results
+data/multi_agent/
 
 # Personal holdings — never commit
 holdings/
