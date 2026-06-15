@@ -1,7 +1,7 @@
 """Run multi-agent judgment on the top N from today's scanner watchlist.
 
 Pulls watchlist from data/snapshots/<today>/watchlist.parquet, scores each name
-through the 4-agent + PM pipeline, writes results to judgments.jsonl in the same
+through the 4-agent + LB pipeline, writes results to judgments.jsonl in the same
 snapshot dir.
 
 CLI:
@@ -114,7 +114,7 @@ def run(top_n: int = 10) -> list[dict]:
 
     # Print summary table
     print("\n=== MULTI-AGENT VERDICTS ===")
-    print(f"{'TICKER':6} {'SCAN':5} {'TECH':5} {'FUND':5} {'SENT':5} {'RISK':5} {'PM':5} {'BIAS':12} {'ACTION':7}")
+    print(f"{'TICKER':6} {'SCAN':5} {'TECH':5} {'FUND':5} {'SENT':5} {'RISK':5} {'LB':5} {'BIAS':12} {'ACTION':7}")
     for r in results:
         pm = r["result"]["pm"]
         print(f"{r['ticker']:6} {r['scanner_score']:>5.1f} "

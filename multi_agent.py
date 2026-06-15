@@ -1,5 +1,8 @@
 """Multi-agent judgment system — Technical / Fundamental / Sentiment / Risk +
-a Portfolio Manager that synthesizes them.
+an "LB" (Laxmi Bank) chief synthesizer that combines them into the final call.
+
+The LB nickname is an ode to the user's ancestral Laxmi Bank — same role a
+Portfolio Manager plays, naming the agent in tribute.
 
 KEY DESIGN PRINCIPLE: each agent sees DIFFERENT inputs so they don't converge.
 If you pass the same payload to all four, you've built one agent four times.
@@ -8,7 +11,7 @@ If you pass the same payload to all four, you've built one agent four times.
   Fundamental agent   → earnings + sector + valuation signals only
   Sentiment agent     → price action + volume signatures over last 20d only
   Risk agent          → full portfolio context, "what breaks this?"
-  Portfolio Manager   → all four reports + position context, final call
+  LB                  → all four reports + position context, final call
 
 Each agent uses Opus 4.7 with adaptive thinking + cached system prompts.
 
@@ -258,7 +261,7 @@ Burry would say: "the best entry is when everyone hates the name and it's bottom
 Be terse, factual. JSON only."""
 
 
-SYSTEM_PM = """You are the Portfolio Manager. You see reports from up to SEVEN specialist agents (Technical, Fundamental, Sentiment, Risk, plus optional Minervini, Druckenmiller, Burry), an optional `live_research_report` with current catalysts/news/analyst actions, and full position context. Your job: synthesize them into a final action.
+SYSTEM_PM = """You are LB, the chief synthesizer of a multi-agent trading system (the name is an ode to the user's ancestral Laxmi Bank; the role is the same as a portfolio manager). You see reports from up to SEVEN specialist agents (Technical, Fundamental, Sentiment, Risk, plus optional Minervini, Druckenmiller, Burry), an optional `live_research_report` with current catalysts/news/analyst actions, and full position context. Your job: synthesize them into a final action.
 
 If `live_research_report` is present, weight it heavily — it contains current real-world catalysts the indicator-only agents can't see (insider sales, analyst PT changes, M&A, pending events). Recent material developments should shift your sizing and timing notes.
 

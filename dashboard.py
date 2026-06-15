@@ -33,6 +33,8 @@ from portfolio import (
     INDIVIDUAL_MARGIN_SNAPSHOT, margin_annual_cost, margin_summary,
     position_action, TRADE_ELIGIBLE_ACCOUNTS, LOCKED_POSITIONS, MAX_POSITION_PCT,
 )
+import json as _json
+from data_fetch import DATA_DIR as _DATA_DIR
 
 
 st.set_page_config(
@@ -157,6 +159,46 @@ def load_portfolio() -> pd.DataFrame:
     return pd.read_parquet(p)
 
 
+@st.cache_data(ttl=3600)
+def load_macro_regime():
+    """Cached macro regime read (computing is slow due to S&P 500 EMA scan)."""
+    try:
+        from macro_gate import compute_regime
+        return compute_regime()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300)
+def load_lb_judgments(date_str: str) -> dict:
+    """Read judgments_portfolio.jsonl from today's snapshot.
+    Returns dict keyed by ticker -> result dict (with LB + investor agents)."""
+    p = _DATA_DIR / "snapshots" / date_str / "judgments_portfolio.jsonl"
+    if not p.exists():
+        return {}
+    out = {}
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = _json.loads(line)
+            out[r["ticker"]] = r
+        except Exception:
+            continue
+    return out
+
+
+@st.cache_data(ttl=300)
+def load_research(date_str: str, ticker: str) -> dict | None:
+    p = _DATA_DIR / "research" / date_str / f"{ticker}.json"
+    if not p.exists():
+        return None
+    try:
+        return _json.loads(p.read_text())
+    except Exception:
+        return None
+
+
 def _column_config_for(df: pd.DataFrame) -> dict:
     """Build a column_config dict for st.dataframe from COLUMN_HELP."""
     return {
@@ -219,6 +261,26 @@ if page == "My Portfolio":
         st.error("No portfolio data found. Run `python portfolio.py` to parse holdings.")
         st.stop()
 
+    # ---- Macro regime banner ----
+    regime = load_macro_regime()
+    if regime and regime.get("composite_score") is not None:
+        score = regime["composite_score"]
+        label = regime["regime_label"]
+        # Pick color tone based on score
+        if score >= 70: bg = "#1b4332"  # green-tinted
+        elif score >= 50: bg = "#2d3748"  # neutral
+        else: bg = "#5c1f1f"  # red-tinted
+        st.markdown(
+            f"<div style='background-color:{bg};padding:10px 14px;border-radius:6px;margin-bottom:14px;'>"
+            f"<strong>Macro regime:</strong> {score:.0f}/100 — <em>{label}</em><br>"
+            f"<small>VIX {regime['vix']['value']:.1f} · "
+            f"{regime['breadth']['pct_above_50_ema']:.0f}% of S&P > 50 EMA · "
+            f"{regime['breadth']['pct_above_200_ema']:.0f}% > 200 EMA · "
+            f"HYG {'above' if regime['credit']['hyg_above_200_ema'] else 'below'} 200 EMA</small>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
     # ---- Account-level summary ----
     total_value = portfolio_df["value"].sum()
 
@@ -267,9 +329,16 @@ if page == "My Portfolio":
 
     cols = st.columns([1, 1, 4])
     with cols[0]:
-        score_btn = st.button("Score trade-eligible positions with Claude")
+        score_btn = st.button("Score trade-eligible positions with LB")
     with cols[1]:
         bypass = st.checkbox("Bypass cache", key="pf_bypass")
+
+    # ---- Load LB (multi-agent) judgments + research from today's snapshot ----
+    today_str = str(latest_date.date())
+    lb_judgments = load_lb_judgments(today_str)
+    if lb_judgments:
+        st.caption(f"Found multi-agent judgments for {len(lb_judgments)} positions in today's snapshot "
+                   f"(run `python portfolio_judge.py` to refresh)")
 
     # Build payloads for trade-eligible positions
     payloads = {}
@@ -407,22 +476,123 @@ if page == "My Portfolio":
     st.subheader("Sector allocation")
     st.dataframe(sec_alloc, hide_index=True, use_container_width=True)
 
-    # ---- Claude per-position deep-dives ----
-    if claude_pf:
-        st.subheader("Claude per-position analysis")
-        sorted_results = sorted(claude_pf.items(), key=lambda kv: -kv[1].score)
-        for (t, acct), j in sorted_results:
-            with st.expander(f"{t} ({ACCOUNT_LABEL.get(acct, acct)})  —  score {j.score} ({j.bias.upper()})"):
-                st.markdown(f"**Thesis:** {j.thesis}")
-                st.markdown(f"**Risks:** {j.risks}")
-                f = j.factors
-                fcols = st.columns(6)
-                for col, (n, v) in zip(fcols, [
-                    ("Setup", f.setup_quality), ("Trend", f.trend_regime),
-                    ("RS", f.relative_strength), ("Sector", f.sector_tailwind),
-                    ("Catalyst", f.catalyst_proximity), ("Risk/Rew", f.risk_reward),
-                ]):
-                    col.metric(n, f"{v}/10")
+    # ---- Per-position deep-dives (single-agent quick OR LB multi-agent if available) ----
+    if claude_pf or lb_judgments:
+        st.subheader("Per-position analysis")
+        # Iterate by single-agent score where available, otherwise by LB score
+        all_keys = set(claude_pf.keys())
+        for ticker in lb_judgments.keys():
+            for (t, acct) in payloads.keys():
+                if t == ticker:
+                    all_keys.add((t, acct))
+                    break
+
+        def _sort_key(kv):
+            (t, acct) = kv if isinstance(kv, tuple) else (kv, "")
+            if (t, acct) in claude_pf:
+                return -claude_pf[(t, acct)].score
+            if t in lb_judgments:
+                return -lb_judgments[t]["result"]["pm"]["final_score"]
+            return 0
+
+        for key in sorted(all_keys, key=_sort_key):
+            (t, acct) = key
+            j_quick = claude_pf.get((t, acct))
+            j_lb = lb_judgments.get(t)
+            research = load_research(today_str, t)
+
+            # Build header
+            if j_lb:
+                pm = j_lb["result"]["pm"]
+                header = f"{t} ({ACCOUNT_LABEL.get(acct, acct).split(' ')[0]}) — LB {pm['final_score']}/100 · {pm['action']} · conf {pm['confidence']}/10"
+            elif j_quick:
+                header = f"{t} ({ACCOUNT_LABEL.get(acct, acct).split(' ')[0]}) — quick {j_quick.score}/100 · {j_quick.bias.upper()}"
+            else:
+                header = f"{t} ({ACCOUNT_LABEL.get(acct, acct).split(' ')[0]})"
+
+            with st.expander(header):
+                # LB verdict (preferred display when available)
+                if j_lb:
+                    pm = j_lb["result"]["pm"]
+                    st.markdown(f"### LB synthesizer (final)")
+                    st.markdown(f"**Thesis:** {pm['thesis']}")
+                    st.markdown(f"**Key risk:** {pm['key_risk']}")
+                    st.markdown(f"**Sizing:** {pm['sizing_note']}")
+                    st.markdown("---")
+
+                    # Specialist agent scores
+                    st.markdown("**Specialist scores:**")
+                    cols_s = st.columns(4)
+                    r = j_lb["result"]
+                    for col, (name, key) in zip(cols_s, [
+                        ("Technical", "technical"),
+                        ("Fundamental", "fundamental"),
+                        ("Sentiment", "sentiment"),
+                        ("Risk", "risk"),
+                    ]):
+                        if r.get(key):
+                            col.metric(name, f"{r[key]['score']}/100")
+
+                    # Investor philosophy scores (if present)
+                    if any(r.get(k) for k in ("minervini", "druckenmiller", "burry")):
+                        st.markdown("**Investor philosophies:**")
+                        cols_i = st.columns(3)
+                        if r.get("minervini"):
+                            m = r["minervini"]
+                            cols_i[0].metric("Minervini",
+                                             f"{m['score']}/100",
+                                             delta=f"VCP={m['vcp_grade']} · entry {m['entry_proximity']}/10",
+                                             delta_color="off")
+                            cols_i[0].caption(m["summary"])
+                        if r.get("druckenmiller"):
+                            d = r["druckenmiller"]
+                            cols_i[1].metric("Druckenmiller",
+                                             f"{d['score']}/100",
+                                             delta=f"cycle: {d['cycle_position']}",
+                                             delta_color="off")
+                            cols_i[1].caption(d["summary"])
+                        if r.get("burry"):
+                            b = r["burry"]
+                            cols_i[2].metric("Burry",
+                                             f"{b['score']}/100",
+                                             delta=f"mean-rev {b['mean_reversion_probability_pct']}% · ext {b['extension_risk']}/10",
+                                             delta_color="off")
+                            cols_i[2].caption(b["summary"])
+
+                # Research summary (if present)
+                if research:
+                    st.markdown("---")
+                    st.markdown(f"### Live research")
+                    sent_emoji = {"bullish": "📈", "bearish": "📉", "neutral": "➡️"}.get(research.get("sentiment"), "")
+                    st.markdown(f"{sent_emoji} **Sentiment:** {research.get('sentiment', '?')}")
+                    st.markdown(f"**Catalyst summary:** {research.get('catalyst_summary', '')}")
+                    if research.get("recent_developments"):
+                        st.markdown("**Recent developments:**")
+                        for d in research["recent_developments"][:5]:
+                            st.markdown(f"- {d}")
+                    if research.get("pending_catalysts"):
+                        st.markdown("**Pending catalysts:**")
+                        for c in research["pending_catalysts"][:4]:
+                            st.markdown(f"- {c}")
+                    st.markdown(f"**Key risks:** {research.get('key_risks', '')}")
+                    if research.get("sources"):
+                        with st.expander("Sources"):
+                            for s in research["sources"][:6]:
+                                st.markdown(f"- [{s['title'][:80]}]({s['url']})")
+
+                # Single-agent fallback (when LB judgments missing)
+                if j_quick and not j_lb:
+                    st.markdown("### Quick single-agent score")
+                    st.markdown(f"**Thesis:** {j_quick.thesis}")
+                    st.markdown(f"**Risks:** {j_quick.risks}")
+                    f = j_quick.factors
+                    fcols = st.columns(6)
+                    for col, (n, v) in zip(fcols, [
+                        ("Setup", f.setup_quality), ("Trend", f.trend_regime),
+                        ("RS", f.relative_strength), ("Sector", f.sector_tailwind),
+                        ("Catalyst", f.catalyst_proximity), ("Risk/Rew", f.risk_reward),
+                    ]):
+                        col.metric(n, f"{v}/10")
 
 
 elif page == "Today's Brief":

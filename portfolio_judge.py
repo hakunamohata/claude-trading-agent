@@ -104,7 +104,7 @@ def run() -> list[dict]:
     save_jsonl("judgments_portfolio", results)
     print(f"\nWrote {len(results)} judgments to data/snapshots/{datetime.now().strftime('%Y-%m-%d')}/judgments_portfolio.jsonl")
 
-    # Summary by PM action
+    # Summary by LB action
     print("\n=== SUMMARY BY ACTION ===")
     from collections import defaultdict
     by_action = defaultdict(list)
@@ -121,7 +121,7 @@ def run() -> list[dict]:
             pm = r["result"]["pm"]
             print(f"  {r['ticker']:6s} ({r['account'].split()[0]:<12}) "
                   f"${r['value']:>8,.0f} ({r['pct_portfolio']:>4.1f}%)  "
-                  f"PM {pm['final_score']:>3d}/{pm['confidence']}/10")
+                  f"LB {pm['final_score']:>3d}/{pm['confidence']}/10")
             print(f"    {pm['thesis']}")
             print(f"    SIZING: {pm['sizing_note']}")
 
