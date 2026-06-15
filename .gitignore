@@ -1,0 +1,27 @@
+# Secrets — never commit
+.env
+*.key
+
+# User-specific config (holdings, account IDs, rules) — never commit
+user_config.py
+
+# Data cache + scan/judgment outputs — all user-specific or large binaries
+data/*.parquet
+data/scans/
+data/judgments/
+# data/snapshots/ contains portfolio judgments with cost basis — never commit
+data/snapshots/
+
+# Personal holdings — never commit
+holdings/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
