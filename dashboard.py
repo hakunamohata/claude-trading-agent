@@ -171,13 +171,41 @@ def load_macro_regime():
         return None
 
 
+def _latest_snapshot_date_with(filename: str) -> str | None:
+    """Find the most recent snapshot directory that contains `filename`.
+    Returns the date string, or None if none found."""
+    base = _DATA_DIR / "snapshots"
+    if not base.exists():
+        return None
+    candidates = sorted([d.name for d in base.iterdir() if d.is_dir()], reverse=True)
+    for d in candidates:
+        if (base / d / filename).exists():
+            return d
+    return None
+
+
+def _latest_research_date_with(ticker: str) -> str | None:
+    base = _DATA_DIR / "research"
+    if not base.exists():
+        return None
+    candidates = sorted([d.name for d in base.iterdir() if d.is_dir()], reverse=True)
+    for d in candidates:
+        if (base / d / f"{ticker}.json").exists():
+            return d
+    return None
+
+
 @st.cache_data(ttl=300)
-def load_lb_judgments(date_str: str) -> dict:
-    """Read judgments_portfolio.jsonl from today's snapshot.
-    Returns dict keyed by ticker -> result dict (with LB + investor agents)."""
-    p = _DATA_DIR / "snapshots" / date_str / "judgments_portfolio.jsonl"
+def load_lb_judgments(date_str: str | None = None) -> tuple[dict, str | None]:
+    """Read judgments_portfolio.jsonl from today's snapshot (or the most recent
+    snapshot directory that has it). Returns (mapping, date_used)."""
+    used = date_str
+    p = _DATA_DIR / "snapshots" / (date_str or "_nope_") / "judgments_portfolio.jsonl"
     if not p.exists():
-        return {}
+        used = _latest_snapshot_date_with("judgments_portfolio.jsonl")
+        if not used:
+            return {}, None
+        p = _DATA_DIR / "snapshots" / used / "judgments_portfolio.jsonl"
     out = {}
     for line in p.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -187,16 +215,24 @@ def load_lb_judgments(date_str: str) -> dict:
             out[r["ticker"]] = r
         except Exception:
             continue
-    return out
+    return out, used
 
 
 @st.cache_data(ttl=300)
-def load_research(date_str: str, ticker: str) -> dict | None:
-    p = _DATA_DIR / "research" / date_str / f"{ticker}.json"
-    if not p.exists():
+def load_research(date_str: str | None, ticker: str) -> dict | None:
+    """Load research for a ticker — try given date first, then most recent."""
+    if date_str:
+        p = _DATA_DIR / "research" / date_str / f"{ticker}.json"
+        if p.exists():
+            try:
+                return _json.loads(p.read_text())
+            except Exception:
+                pass
+    used = _latest_research_date_with(ticker)
+    if not used:
         return None
     try:
-        return _json.loads(p.read_text())
+        return _json.loads((_DATA_DIR / "research" / used / f"{ticker}.json").read_text())
     except Exception:
         return None
 
@@ -231,7 +267,7 @@ def _sector_strength_today(sector_strength: pd.DataFrame, ticker: str, latest_da
 # ---------- Sidebar ----------
 
 st.sidebar.title("Breakout Agent")
-page = st.sidebar.radio("Page", ["My Portfolio", "Today's Brief", "Chart Browser", "Backtest Explorer"])
+page = st.sidebar.radio("Page", ["My Portfolio", "Research Done", "Today's Brief", "Chart Browser", "Backtest Explorer"])
 
 if st.sidebar.button("Force refresh data"):
     load_universe_data.clear()
@@ -335,12 +371,17 @@ if page == "My Portfolio":
     with cols[1]:
         bypass = st.checkbox("Bypass cache", key="pf_bypass")
 
-    # ---- Load LB (multi-agent) judgments + research from today's snapshot ----
-    today_str = str(latest_date.date())
-    lb_judgments = load_lb_judgments(today_str)
+    # ---- Load LB (multi-agent) judgments + research from snapshot ----
+    from datetime import datetime as _dt
+    calendar_today = _dt.now().strftime("%Y-%m-%d")
+    lb_judgments, lb_date_used = load_lb_judgments(calendar_today)
+    today_str = lb_date_used or calendar_today
     if lb_judgments:
-        st.caption(f"Found multi-agent judgments for {len(lb_judgments)} positions in today's snapshot "
+        date_note = "today's snapshot" if lb_date_used == calendar_today else f"snapshot from {lb_date_used}"
+        st.caption(f"Found LB multi-agent judgments for {len(lb_judgments)} positions in {date_note} "
                    f"(run `python portfolio_judge.py` to refresh)")
+    else:
+        st.warning("No LB judgments found in any snapshot. Run `python portfolio_judge.py` to populate.")
 
     # Build payloads for trade-eligible positions
     payloads = {}
@@ -482,123 +523,171 @@ if page == "My Portfolio":
     st.subheader("Sector allocation")
     st.dataframe(sec_alloc, hide_index=True, use_container_width=True)
 
-    # ---- Per-position deep-dives (single-agent quick OR LB multi-agent if available) ----
-    if claude_pf or lb_judgments:
-        st.subheader("Per-position analysis")
-        # Iterate by single-agent score where available, otherwise by LB score
-        all_keys = set(claude_pf.keys())
-        for ticker in lb_judgments.keys():
-            for (t, acct) in payloads.keys():
-                if t == ticker:
-                    all_keys.add((t, acct))
-                    break
+    # ---- Pointer to Research Done page ----
+    if lb_judgments or claude_pf:
+        n_lb = len(lb_judgments)
+        n_quick = len(claude_pf)
+        st.info(f"🔍 Per-position deep-dive analysis (LB synthesizer + 4 specialists + 3 investor "
+                f"philosophies + live web research) lives on the **Research Done** page. "
+                f"{n_lb} positions have LB judgments, {n_quick} have single-agent scores.")
 
-        def _sort_key(kv):
-            (t, acct) = kv if isinstance(kv, tuple) else (kv, "")
-            if (t, acct) in claude_pf:
-                return -claude_pf[(t, acct)].score
-            if t in lb_judgments:
-                return -lb_judgments[t]["result"]["pm"]["final_score"]
-            return 0
 
-        for key in sorted(all_keys, key=_sort_key):
-            (t, acct) = key
-            j_quick = claude_pf.get((t, acct))
-            j_lb = lb_judgments.get(t)
-            research = load_research(today_str, t)
+elif page == "Research Done":
+    st.title("Research Done — per-position deep-dive")
 
-            # Build header
-            if j_lb:
-                pm = j_lb["result"]["pm"]
-                header = f"{t} ({ACCOUNT_LABEL.get(acct, acct).split(' ')[0]}) — LB {pm['final_score']}/100 · {pm['action']} · conf {pm['confidence']}/10"
-            elif j_quick:
-                header = f"{t} ({ACCOUNT_LABEL.get(acct, acct).split(' ')[0]}) — quick {j_quick.score}/100 · {j_quick.bias.upper()}"
-            else:
-                header = f"{t} ({ACCOUNT_LABEL.get(acct, acct).split(' ')[0]})"
+    # ---- Macro regime banner ----
+    regime = load_macro_regime()
+    if regime and regime.get("composite_score") is not None:
+        score = regime["composite_score"]
+        label = regime["regime_label"]
+        if score >= 70: bg = "#1b4332"
+        elif score >= 50: bg = "#2d3748"
+        else: bg = "#5c1f1f"
+        st.markdown(
+            f"<div style='background-color:{bg};padding:10px 14px;border-radius:6px;margin-bottom:14px;'>"
+            f"<strong>Macro regime:</strong> {score:.0f}/100 — <em>{label}</em><br>"
+            f"<small>VIX {regime['vix']['value']:.1f} · "
+            f"{regime['breadth']['pct_above_50_ema']:.0f}% of S&P > 50 EMA · "
+            f"{regime['breadth']['pct_above_200_ema']:.0f}% > 200 EMA · "
+            f"HYG {'above' if regime['credit']['hyg_above_200_ema'] else 'below'} 200 EMA</small>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
-            with st.expander(header):
-                # LB verdict (preferred display when available)
-                if j_lb:
-                    pm = j_lb["result"]["pm"]
-                    st.markdown(f"### LB synthesizer (final)")
-                    st.markdown(f"**Thesis:** {pm['thesis']}")
-                    st.markdown(f"**Key risk:** {pm['key_risk']}")
-                    st.markdown(f"**Sizing:** {pm['sizing_note']}")
-                    st.markdown("---")
+    # ---- Load LB judgments ----
+    from datetime import datetime as _dt
+    calendar_today = _dt.now().strftime("%Y-%m-%d")
+    lb_judgments, lb_date_used = load_lb_judgments(calendar_today)
 
-                    # Specialist agent scores
-                    st.markdown("**Specialist scores:**")
-                    cols_s = st.columns(4)
-                    r = j_lb["result"]
-                    for col, (name, key) in zip(cols_s, [
-                        ("Technical", "technical"),
-                        ("Fundamental", "fundamental"),
-                        ("Sentiment", "sentiment"),
-                        ("Risk", "risk"),
-                    ]):
-                        if r.get(key):
-                            col.metric(name, f"{r[key]['score']}/100")
+    if not lb_judgments:
+        st.warning(
+            "No LB judgments found yet. Run one of these to populate:\n\n"
+            "```\npython portfolio_judge.py                            # 4 agents only\n"
+            "python portfolio_judge.py --investor-agents               # 7 agents\n"
+            "python portfolio_judge.py --investor-agents --with-research  # 7 + live research\n```"
+        )
+        st.stop()
 
-                    # Investor philosophy scores (if present)
-                    if any(r.get(k) for k in ("minervini", "druckenmiller", "burry")):
-                        st.markdown("**Investor philosophies:**")
-                        cols_i = st.columns(3)
-                        if r.get("minervini"):
-                            m = r["minervini"]
-                            cols_i[0].metric("Minervini",
-                                             f"{m['score']}/100",
-                                             delta=f"VCP={m['vcp_grade']} · entry {m['entry_proximity']}/10",
-                                             delta_color="off")
-                            cols_i[0].caption(m["summary"])
-                        if r.get("druckenmiller"):
-                            d = r["druckenmiller"]
-                            cols_i[1].metric("Druckenmiller",
-                                             f"{d['score']}/100",
-                                             delta=f"cycle: {d['cycle_position']}",
-                                             delta_color="off")
-                            cols_i[1].caption(d["summary"])
-                        if r.get("burry"):
-                            b = r["burry"]
-                            cols_i[2].metric("Burry",
-                                             f"{b['score']}/100",
-                                             delta=f"mean-rev {b['mean_reversion_probability_pct']}% · ext {b['extension_risk']}/10",
-                                             delta_color="off")
-                            cols_i[2].caption(b["summary"])
+    date_note = "today's snapshot" if lb_date_used == calendar_today else f"snapshot from {lb_date_used}"
+    st.caption(f"Loaded {len(lb_judgments)} LB judgments from {date_note}.")
 
-                # Research summary (if present)
-                if research:
-                    st.markdown("---")
-                    st.markdown(f"### Live research")
-                    sent_emoji = {"bullish": "📈", "bearish": "📉", "neutral": "➡️"}.get(research.get("sentiment"), "")
-                    st.markdown(f"{sent_emoji} **Sentiment:** {research.get('sentiment', '?')}")
-                    st.markdown(f"**Catalyst summary:** {research.get('catalyst_summary', '')}")
-                    if research.get("recent_developments"):
-                        st.markdown("**Recent developments:**")
-                        for d in research["recent_developments"][:5]:
-                            st.markdown(f"- {d}")
-                    if research.get("pending_catalysts"):
-                        st.markdown("**Pending catalysts:**")
-                        for c in research["pending_catalysts"][:4]:
-                            st.markdown(f"- {c}")
-                    st.markdown(f"**Key risks:** {research.get('key_risks', '')}")
-                    if research.get("sources"):
-                        with st.expander("Sources"):
-                            for s in research["sources"][:6]:
-                                st.markdown(f"- [{s['title'][:80]}]({s['url']})")
+    # ---- Build per-ticker account lookup ----
+    ticker_to_account = {}
+    if not portfolio_df.empty:
+        for _, row in portfolio_df.iterrows():
+            t = row["ticker"]
+            acct = row["account_id"]
+            ticker_to_account.setdefault(t, []).append(acct)
 
-                # Single-agent fallback (when LB judgments missing)
-                if j_quick and not j_lb:
-                    st.markdown("### Quick single-agent score")
-                    st.markdown(f"**Thesis:** {j_quick.thesis}")
-                    st.markdown(f"**Risks:** {j_quick.risks}")
-                    f = j_quick.factors
-                    fcols = st.columns(6)
-                    for col, (n, v) in zip(fcols, [
-                        ("Setup", f.setup_quality), ("Trend", f.trend_regime),
-                        ("RS", f.relative_strength), ("Sector", f.sector_tailwind),
-                        ("Catalyst", f.catalyst_proximity), ("Risk/Rew", f.risk_reward),
-                    ]):
-                        col.metric(n, f"{v}/10")
+    # ---- Action filter ----
+    actions = sorted(set(j["result"]["pm"]["action"] for j in lb_judgments.values()))
+    filt_cols = st.columns([2, 5])
+    with filt_cols[0]:
+        action_filter = st.multiselect(
+            "Filter by action",
+            options=actions,
+            default=actions,
+        )
+
+    # ---- Display each ticker (sorted by LB score desc) ----
+    sorted_judgments = sorted(
+        lb_judgments.items(),
+        key=lambda kv: -kv[1]["result"]["pm"]["final_score"],
+    )
+
+    for ticker, j_lb in sorted_judgments:
+        pm = j_lb["result"]["pm"]
+        if pm["action"] not in action_filter:
+            continue
+
+        accounts = ticker_to_account.get(ticker, ["—"])
+        acct_label = ACCOUNT_LABEL.get(accounts[0], accounts[0]).split(" ")[0] if accounts else "—"
+
+        bias_emoji = {
+            "strong_long": "🟢🟢", "long": "🟢",
+            "watch": "🟡", "trim": "🟠", "avoid": "🔴",
+        }.get(pm.get("bias", "watch"), "")
+
+        header = f"{bias_emoji} {ticker} ({acct_label}) — LB {pm['final_score']}/100 · {pm['action']} · conf {pm['confidence']}/10"
+
+        with st.expander(header):
+            # LB synthesizer (always show)
+            st.markdown(f"### LB synthesizer (final)")
+            st.markdown(f"**Thesis:** {pm['thesis']}")
+            st.markdown(f"**Key risk:** {pm['key_risk']}")
+            st.markdown(f"**Sizing:** {pm['sizing_note']}")
+            st.markdown("---")
+
+            r = j_lb["result"]
+
+            # Specialist scores
+            st.markdown("**Specialist scores:**")
+            cols_s = st.columns(4)
+            for col, (name, key) in zip(cols_s, [
+                ("Technical", "technical"),
+                ("Fundamental", "fundamental"),
+                ("Sentiment", "sentiment"),
+                ("Risk", "risk"),
+            ]):
+                if r.get(key):
+                    col.metric(name, f"{r[key]['score']}/100")
+                    col.caption(r[key]["summary"])
+
+            # Investor philosophy scores
+            if any(r.get(k) for k in ("minervini", "druckenmiller", "burry")):
+                st.markdown("**Investor philosophies:**")
+                cols_i = st.columns(3)
+                if r.get("minervini"):
+                    m = r["minervini"]
+                    cols_i[0].metric(
+                        "Minervini",
+                        f"{m['score']}/100",
+                        delta=f"VCP={m['vcp_grade']} · entry {m['entry_proximity']}/10",
+                        delta_color="off",
+                    )
+                    cols_i[0].caption(m["summary"])
+                if r.get("druckenmiller"):
+                    d = r["druckenmiller"]
+                    cols_i[1].metric(
+                        "Druckenmiller",
+                        f"{d['score']}/100",
+                        delta=f"cycle: {d['cycle_position']}",
+                        delta_color="off",
+                    )
+                    cols_i[1].caption(d["summary"])
+                if r.get("burry"):
+                    b = r["burry"]
+                    cols_i[2].metric(
+                        "Burry",
+                        f"{b['score']}/100",
+                        delta=f"mean-rev {b['mean_reversion_probability_pct']}% · ext {b['extension_risk']}/10",
+                        delta_color="off",
+                    )
+                    cols_i[2].caption(b["summary"])
+
+            # Live research
+            research = load_research(lb_date_used, ticker)
+            if research:
+                st.markdown("---")
+                st.markdown(f"### Live research")
+                sent_emoji = {"bullish": "📈", "bearish": "📉", "neutral": "➡️"}.get(
+                    research.get("sentiment"), ""
+                )
+                st.markdown(f"{sent_emoji} **Sentiment:** {research.get('sentiment', '?')}")
+                st.markdown(f"**Catalyst summary:** {research.get('catalyst_summary', '')}")
+                if research.get("recent_developments"):
+                    st.markdown("**Recent developments:**")
+                    for dev in research["recent_developments"][:6]:
+                        st.markdown(f"- {dev}")
+                if research.get("pending_catalysts"):
+                    st.markdown("**Pending catalysts (next 30-60d):**")
+                    for c in research["pending_catalysts"][:4]:
+                        st.markdown(f"- {c}")
+                st.markdown(f"**Key risks:** {research.get('key_risks', '')}")
+                if research.get("sources"):
+                    with st.expander("Sources"):
+                        for s in research["sources"][:6]:
+                            st.markdown(f"- [{s['title'][:90]}]({s['url']})")
 
 
 elif page == "Today's Brief":
