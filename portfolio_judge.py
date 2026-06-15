@@ -1,9 +1,16 @@
 """Run multi-agent judgment on every non-locked portfolio position.
 
-Costs ~$0.025/ticker × 27 non-MSFT positions = ~$0.70 per full run. Cached so
-re-runs hit disk.
+Default: 4 functional agents (~$0.025/ticker, ~$0.70 per full run).
+With --investor-agents: adds Minervini/Druckenmiller/Burry (~$0.04/ticker, ~$1.10 run).
+With --with-research: adds web-search research per ticker (~$0.10/ticker added).
 
-Output: data/snapshots/<today>/judgments.jsonl with full multi-agent results
+Output: data/snapshots/<today>/judgments_portfolio.jsonl with structured results.
+
+CLI:
+    python portfolio_judge.py                            # 4 agents only
+    python portfolio_judge.py --investor-agents          # 7 agents
+    python portfolio_judge.py --investor-agents --with-research   # 7 + live research
+    python portfolio_judge.py --refresh                  # bypass research cache
 """
 
 from __future__ import annotations
@@ -28,7 +35,27 @@ from portfolio import (
 NON_EQUITY = {"FDRXX", "SPAXX", "NHFSMKX98", "CASH_ROTH", "CASH_TOD", "CASH_HSA"}
 
 
-def run() -> list[dict]:
+# Theme tag inference — used by Druckenmiller agent for "is this a megatrend name?"
+# Simple sector-based mapping; refine over time.
+THEME_BY_SECTOR_ETF = {
+    "SOXX": "AI infra / semis super-cycle",
+    "XLK": "AI / cloud / software platform",
+    "XLC": "communications / digital advertising",
+    "XLY": "consumer discretionary / EVs",
+    "XLP": "defensive consumer staples",
+    "XLF": "financials / fintech",
+    "XLV": "healthcare / biotech",
+    "XLI": "industrials / re-industrialization",
+    "XLE": "energy",
+    "XLU": "utilities / AI power",
+    "XLB": "materials",
+    "XLRE": "real estate / data centers",
+}
+
+
+def run(include_investor_agents: bool = False,
+        with_research: bool = False,
+        research_refresh: bool = False) -> list[dict]:
     pf = pd.read_parquet(HOLDINGS_DIR / "positions_current.parquet")
     pf_total = float(pf["value"].sum())
 
@@ -37,7 +64,23 @@ def run() -> list[dict]:
         ~pf["ticker"].isin(LOCKED_POSITIONS | NON_EQUITY)
         & pf["ticker"].notna()
     ].copy()
-    print(f"Multi-agent on {len(work)} positions (total household ${pf_total:,.0f})")
+    flags = []
+    if include_investor_agents: flags.append("+investor agents")
+    if with_research: flags.append("+live research")
+    flag_str = f"  ({', '.join(flags)})" if flags else ""
+    print(f"Multi-agent on {len(work)} positions (total household ${pf_total:,.0f}){flag_str}")
+
+    # Macro regime is needed when investor agents are on (Druckenmiller uses it)
+    macro_score = None
+    if include_investor_agents:
+        print("Computing macro regime...")
+        try:
+            from macro_gate import compute_regime
+            regime = compute_regime()
+            macro_score = regime.get("composite_score")
+            print(f"  Macro: {macro_score:.0f}/100 — {regime.get('regime_label', '?')}")
+        except Exception as e:
+            print(f"  ! macro regime failed: {e}")
 
     # Load market context once
     tickers_needed = work["ticker"].tolist()
@@ -80,6 +123,19 @@ def run() -> list[dict]:
             earnings_lbl = earnings_proximity_label(days_e)
 
             value = float(row["value"])
+
+            # Optionally pull live research summary for this ticker (web search)
+            research_dict = None
+            if with_research:
+                try:
+                    from research import research_ticker
+                    rep = research_ticker(t, use_cache=not research_refresh)
+                    research_dict = rep.model_dump()
+                except Exception as e:
+                    print(f"    ! research failed for {t}: {e}")
+
+            theme_tag = THEME_BY_SECTOR_ETF.get(sec_id, "neutral")
+
             print(f"  Scoring {t} ({ACCOUNT_LABEL.get(acct, acct).split()[0]})  ${value:,.0f}...")
             result = evaluate_full(
                 ticker=t,
@@ -89,6 +145,11 @@ def run() -> list[dict]:
                 account_type=ACCOUNT_LABEL.get(acct, acct),
                 trade_eligible=(acct in TRADE_ELIGIBLE_ACCOUNTS),
                 ticker_in_locked=(t in LOCKED_POSITIONS),
+                include_investor_agents=include_investor_agents,
+                close_series=raw[t]["close"] if include_investor_agents else None,
+                macro_score=macro_score,
+                theme_tag=theme_tag,
+                research_report=research_dict,
             )
             results.append({
                 "ticker": t,
@@ -129,4 +190,12 @@ def run() -> list[dict]:
 
 
 if __name__ == "__main__":
-    run()
+    args = sys.argv[1:]
+    include_investor = "--investor-agents" in args
+    with_research = "--with-research" in args
+    research_refresh = "--refresh" in args
+    run(
+        include_investor_agents=include_investor,
+        with_research=with_research,
+        research_refresh=research_refresh,
+    )

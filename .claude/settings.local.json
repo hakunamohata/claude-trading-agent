@@ -57,7 +57,8 @@
       "WebFetch(domain:www.youtube.com)",
       "WebFetch(domain:youtubetranscript.com)",
       "WebFetch(domain:www.youtube-transcript.io)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(netstat -ano)"
     ]
   }
 }

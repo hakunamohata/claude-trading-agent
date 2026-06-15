@@ -17,7 +17,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from universe import ALL_TICKERS, TARGETS, BENCHMARK, SECTOR_ETFS, TICKER_TO_SECTOR
+from universe import ALL_TICKERS, TARGETS, BENCHMARK, SECTOR_ETFS, TICKER_TO_SECTOR, sector_name
 from data_fetch import fetch_many, DATA_DIR
 from breakout import (
     build_features, any_breakout_signal, signal_components,
@@ -106,8 +106,10 @@ COLUMN_HELP: dict[str, str] = {
                 "Wider universe will sharpen this."),
     "RS 60d %": ("Stock's 60-day return minus QQQ's 60-day return, in percentage points. "
                  "Positive = outperforming the benchmark."),
-    "Sector RS %": ("Stock's sector ETF (SOXX for semis, XLK for software, etc.) 60-day return "
-                    "minus QQQ 60-day return. Positive = the sector is leading the market."),
+    "Sector": "Human-readable sector classification (e.g. Semiconductors, Technology, Financials)",
+    "Sector ETF": "Underlying sector ETF used for sector-relative-strength tagging (SOXX, XLK, etc.)",
+    "Sector RS %": ("Stock's sector ETF 60-day return minus QQQ 60-day return. "
+                    "Positive = the sector is leading the market."),
     "Earnings in": ("Days-to-next-earnings label. "
                     "imminent = <=7d (risk-off setups extending into earnings), "
                     "soon = 8-21d, "
@@ -470,8 +472,12 @@ if page == "My Portfolio":
 
     # ---- Sector allocation ----
     from universe import TICKER_TO_SECTOR
-    df_hold["sector"] = df_hold["Ticker"].map(TICKER_TO_SECTOR).fillna("Other/Cash")
-    sec_alloc = df_hold.groupby("sector")["Value"].sum().sort_values(ascending=False).reset_index()
+    df_hold["Sector ETF"] = df_hold["Ticker"].map(TICKER_TO_SECTOR).fillna("Other/Cash")
+    df_hold["Sector"] = df_hold["Sector ETF"].map(lambda x: sector_name(x) if x != "Other/Cash" else "Other/Cash")
+    sec_alloc = (
+        df_hold.groupby(["Sector", "Sector ETF"])["Value"].sum()
+        .sort_values(ascending=False).reset_index()
+    )
     sec_alloc["% of total"] = (sec_alloc["Value"] / total_value * 100).round(1)
     st.subheader("Sector allocation")
     st.dataframe(sec_alloc, hide_index=True, use_container_width=True)
@@ -646,6 +652,7 @@ elif page == "Today's Brief":
                 "Vol×": round(vol_x, 2) if vol_x is not None else None,
                 "RS rank": rs_rank_str,
                 "RS 60d %": round(rs_60, 1) if rs_60 is not None else None,
+                "Sector": sector_name(TICKER_TO_SECTOR.get(t)) or "—",
                 "Sector RS %": round(sec_str, 1) if sec_str is not None else None,
                 "Earnings in": earnings_lbl,
                 "50 EMA": round(feat_row["ema_50"], 2),
@@ -662,7 +669,8 @@ elif page == "Today's Brief":
                     "Vol×": round(vol_x, 2) if vol_x is not None else None,
                     "RS rank": rs_rank_str,
                     "RS 60d %": round(rs_60, 1) if rs_60 is not None else None,
-                    "Sector RS %": round(sec_str, 1) if sec_str is not None else None,
+                    "Sector": sector_name(TICKER_TO_SECTOR.get(t)) or "—",
+                "Sector RS %": round(sec_str, 1) if sec_str is not None else None,
                     "Earnings in": earnings_lbl,
                     "Missing": ", ".join(missing),
                 })

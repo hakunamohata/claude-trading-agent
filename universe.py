@@ -46,6 +46,29 @@ BENCHMARK = "QQQ"
 # sector-relative strength.
 SECTOR_ETFS = ["SOXX", "XLK", "XLC", "XLY", "XLP", "XLF", "XLV", "XLE", "XLI", "XLU", "XLB", "XLRE"]
 
+# Human-readable sector names for dashboard / output displays
+SECTOR_ETF_TO_NAME = {
+    "SOXX": "Semiconductors",
+    "XLK":  "Technology",
+    "XLC":  "Communications",
+    "XLY":  "Consumer Discretionary",
+    "XLP":  "Consumer Staples",
+    "XLF":  "Financials",
+    "XLV":  "Healthcare",
+    "XLI":  "Industrials",
+    "XLE":  "Energy",
+    "XLU":  "Utilities",
+    "XLB":  "Materials",
+    "XLRE": "Real Estate",
+}
+
+
+def sector_name(etf_ticker: str | None) -> str | None:
+    """Return the human-readable sector name for a given sector-ETF ticker."""
+    if etf_ticker is None:
+        return None
+    return SECTOR_ETF_TO_NAME.get(etf_ticker, etf_ticker)
+
 
 # Sector mapping. Standard S&P 500 / Nasdaq 100 names get their sector from
 # the framework defaults; user-specific names get tagged via overrides in
