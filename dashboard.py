@@ -220,21 +220,70 @@ def load_lb_judgments(date_str: str | None = None) -> tuple[dict, str | None]:
 
 @st.cache_data(ttl=300)
 def load_research(date_str: str | None, ticker: str) -> dict | None:
-    """Load research for a ticker — try given date first, then most recent."""
+    """Load research for a ticker — try given date first, then most recent.
+    Attaches `_loaded_from_date` to the returned dict so callers can show
+    freshness."""
     if date_str:
         p = _DATA_DIR / "research" / date_str / f"{ticker}.json"
         if p.exists():
             try:
-                return _json.loads(p.read_text())
+                d = _json.loads(p.read_text())
+                d["_loaded_from_date"] = date_str
+                return d
             except Exception:
                 pass
     used = _latest_research_date_with(ticker)
     if not used:
         return None
     try:
-        return _json.loads((_DATA_DIR / "research" / used / f"{ticker}.json").read_text())
+        d = _json.loads((_DATA_DIR / "research" / used / f"{ticker}.json").read_text())
+        d["_loaded_from_date"] = used
+        return d
     except Exception:
         return None
+
+
+def _freshness_label(date_str: str | None, today_str: str | None = None) -> str:
+    """Return a 'today' / 'N days old' / 'N weeks old' label for a YYYY-MM-DD."""
+    if not date_str:
+        return "no date"
+    try:
+        from datetime import datetime as _dt
+        d  = _dt.strptime(date_str, "%Y-%m-%d").date()
+        t  = (_dt.strptime(today_str, "%Y-%m-%d").date()
+              if today_str else _dt.now().date())
+        delta = (t - d).days
+    except Exception:
+        return date_str
+    if delta <= 0:
+        return "today"
+    if delta == 1:
+        return "1 day ago"
+    if delta < 7:
+        return f"{delta} days ago"
+    if delta < 30:
+        weeks = delta // 7
+        return f"{weeks} week{'s' if weeks != 1 else ''} ago"
+    months = delta // 30
+    return f"{months} month{'s' if months != 1 else ''} ago"
+
+
+def _freshness_color(date_str: str | None, today_str: str | None = None) -> str:
+    """Color-code by age. Fresh=green, week-old=yellow, stale=red."""
+    if not date_str:
+        return "#777"
+    try:
+        from datetime import datetime as _dt
+        d  = _dt.strptime(date_str, "%Y-%m-%d").date()
+        t  = (_dt.strptime(today_str, "%Y-%m-%d").date()
+              if today_str else _dt.now().date())
+        delta = (t - d).days
+    except Exception:
+        return "#777"
+    if delta <= 1:    return "#1b5e20"   # fresh — green
+    if delta <= 7:    return "#e65100"   # week-old — orange
+    if delta <= 30:   return "#b71c1c"   # stale — red
+    return "#5d4037"                      # very old — brown
 
 
 def _column_config_for(df: pd.DataFrame) -> dict:
@@ -267,7 +316,20 @@ def _sector_strength_today(sector_strength: pd.DataFrame, ticker: str, latest_da
 # ---------- Sidebar ----------
 
 st.sidebar.title("Breakout Agent")
-page = st.sidebar.radio("Page", ["My Portfolio", "Research Done", "Today's Brief", "Chart Browser", "Backtest Explorer"])
+page = st.sidebar.radio("Page", [
+    "Today's Brief",
+    "My Portfolio",
+    "Ticker Analysis",
+    "Today's Actions",
+    "Trade Ticket",
+    "Covered Calls",
+    "QQQ LEAPS Dip-Buy",
+    "LB Backtest",
+    "Research Done",
+    "Chart Browser",
+    "Backtest Explorer",
+    "Glossary",
+])
 
 if st.sidebar.button("Force refresh data"):
     load_universe_data.clear()
@@ -568,8 +630,16 @@ elif page == "Research Done":
         )
         st.stop()
 
-    date_note = "today's snapshot" if lb_date_used == calendar_today else f"snapshot from {lb_date_used}"
-    st.caption(f"Loaded {len(lb_judgments)} LB judgments from {date_note}.")
+    lb_age = _freshness_label(lb_date_used, calendar_today)
+    lb_color = _freshness_color(lb_date_used, calendar_today)
+    st.markdown(
+        f"<div style='display:inline-block;padding:6px 12px;border-radius:6px;"
+        f"background-color:{lb_color};color:#fff;margin-bottom:10px;'>"
+        f"<strong>LB judgments:</strong> {len(lb_judgments)} tickers · "
+        f"analyzed <strong>{lb_date_used}</strong> ({lb_age})"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     # ---- Build per-ticker account lookup ----
     ticker_to_account = {}
@@ -579,21 +649,70 @@ elif page == "Research Done":
             acct = row["account_id"]
             ticker_to_account.setdefault(t, []).append(acct)
 
-    # ---- Action filter ----
+    # ---- Action filter + sort ----
     actions = sorted(set(j["result"]["pm"]["action"] for j in lb_judgments.values()))
-    filt_cols = st.columns([2, 5])
+    filt_cols = st.columns([3, 3, 3])
     with filt_cols[0]:
         action_filter = st.multiselect(
             "Filter by action",
             options=actions,
             default=actions,
         )
+    with filt_cols[1]:
+        sort_by = st.selectbox(
+            "Sort by",
+            options=[
+                "LB score (high → low)",
+                "LB score (low → high)",
+                "Research date (newest first)",
+                "Research date (oldest first)",
+                "LB date (newest first)",
+                "LB date (oldest first)",
+                "Ticker (A → Z)",
+                "Conviction (high → low)",
+            ],
+            index=0,
+        )
 
-    # ---- Display each ticker (sorted by LB score desc) ----
-    sorted_judgments = sorted(
-        lb_judgments.items(),
-        key=lambda kv: -kv[1]["result"]["pm"]["final_score"],
-    )
+    # ---- Pre-compute per-ticker dates (research only; LB date is same for all) ----
+    research_dates: dict[str, str] = {}
+    for t in lb_judgments:
+        rd = load_research(lb_date_used, t)
+        research_dates[t] = rd.get("_loaded_from_date") if rd else ""
+
+    def _sort_key(kv):
+        t, j = kv
+        pm = j["result"]["pm"]
+        score = pm.get("final_score", 0)
+        conf  = pm.get("confidence", 0)
+        rdate = research_dates.get(t, "")  # YYYY-MM-DD sorts lexically by recency
+        if sort_by == "LB score (high → low)":
+            return (-score, t)
+        if sort_by == "LB score (low → high)":
+            return (score, t)
+        if sort_by == "Research date (newest first)":
+            # Empty strings sort to end when reversed
+            return (rdate == "", -ord(rdate[0]) if rdate else 0, rdate * -1 if False else rdate)
+        if sort_by == "Research date (oldest first)":
+            return (rdate == "", rdate, t)
+        if sort_by == "LB date (newest first)":
+            return (lb_date_used or "", t)
+        if sort_by == "LB date (oldest first)":
+            return (lb_date_used or "", t)
+        if sort_by == "Ticker (A → Z)":
+            return (t,)
+        if sort_by == "Conviction (high → low)":
+            return (-conf, -score, t)
+        return (-score, t)
+
+    sorted_judgments = sorted(lb_judgments.items(), key=_sort_key)
+    if sort_by == "Research date (newest first)":
+        # Bring tickers WITH a date first, sorted desc by date
+        with_date    = [(t, j) for t, j in lb_judgments.items() if research_dates.get(t)]
+        without_date = [(t, j) for t, j in lb_judgments.items() if not research_dates.get(t)]
+        with_date.sort(key=lambda kv: research_dates[kv[0]], reverse=True)
+        without_date.sort(key=lambda kv: kv[0])
+        sorted_judgments = with_date + without_date
 
     for ticker, j_lb in sorted_judgments:
         pm = j_lb["result"]["pm"]
@@ -608,7 +727,14 @@ elif page == "Research Done":
             "watch": "🟡", "trim": "🟠", "avoid": "🔴",
         }.get(pm.get("bias", "watch"), "")
 
-        header = f"{bias_emoji} {ticker} ({acct_label}) — LB {pm['final_score']}/100 · {pm['action']} · conf {pm['confidence']}/10"
+        # Peek at research date (without rendering body yet) for header freshness
+        _peek = load_research(lb_date_used, ticker)
+        _res_date = _peek.get("_loaded_from_date") if _peek else None
+        _res_age = _freshness_label(_res_date, calendar_today) if _res_date else "no research"
+        header = (f"{bias_emoji} {ticker} ({acct_label}) — "
+                  f"LB {pm['final_score']}/100 · {pm['action']} · conf {pm['confidence']}/10  "
+                  f"· LB {lb_date_used} ({_freshness_label(lb_date_used, calendar_today)})  "
+                  f"· research: {_res_age}")
 
         with st.expander(header):
             # LB synthesizer (always show)
@@ -669,7 +795,16 @@ elif page == "Research Done":
             research = load_research(lb_date_used, ticker)
             if research:
                 st.markdown("---")
-                st.markdown(f"### Live research")
+                res_date = research.get("_loaded_from_date")
+                res_age = _freshness_label(res_date, calendar_today)
+                res_color = _freshness_color(res_date, calendar_today)
+                st.markdown(
+                    f"### Live research &nbsp;"
+                    f"<span style='background-color:{res_color};color:#fff;"
+                    f"padding:3px 10px;border-radius:4px;font-size:0.85em;'>"
+                    f"{res_date} · {res_age}</span>",
+                    unsafe_allow_html=True,
+                )
                 sent_emoji = {"bullish": "📈", "bearish": "📉", "neutral": "➡️"}.get(
                     research.get("sentiment"), ""
                 )
@@ -1074,3 +1209,670 @@ elif page == "Backtest Explorer":
         hits["median_fwd20"] = hits["median_fwd20"].round(1)
         st.dataframe(hits, hide_index=True, use_container_width=True,
                      column_config=_column_config_for(hits))
+
+
+# =============================================================
+# Markdown-artifact pages — render the files cc_income_engine.py,
+# cc_buywrite.py, msft_income.py, todays_actions.py, etc. write daily.
+# =============================================================
+
+def _list_snapshots_with(filename: str) -> list[str]:
+    """Sorted descending list of snapshot dates that contain `filename`."""
+    root = DATA_DIR / "snapshots"
+    if not root.exists():
+        return []
+    out = []
+    for d in sorted(root.glob("*"), reverse=True):
+        if d.is_dir() and (d / filename).exists():
+            out.append(d.name)
+    return out
+
+
+# ---------- Smart markdown renderer with color-coded tables ---------------
+
+# Row background colors by rating value. Lower-priority (lighter) tints for
+# Streamlit's default light theme. Match on uppercase, strip emojis/whitespace.
+_ROW_COLORS = {
+    "GREEN":          "#d4edda",   # safe
+    "SAFE":           "#d4edda",
+    "YELLOW":         "#fff3cd",   # caution
+    "MODERATE":       "#fff3cd",
+    "AGGRESSIVE":     "#ffe5b4",   # peach
+    "EARNINGS-RISK":  "#ffd699",   # orange — discrete event risk
+    "RED":            "#f8d7da",   # danger
+    "DANGEROUS":      "#f8d7da",
+}
+_VERDICT_COLS = {"color", "verdict"}  # column headers we treat as colorizers
+
+
+def _strip_md_inline(s: str) -> str:
+    """Strip markdown bold/italic + emoji decorations for matching."""
+    import re as _re
+    s = _re.sub(r"\*+", "", s).strip()
+    # Drop common emoji decorations the engine adds
+    for ch in ("📅", "🔒", "🚨", "⚠️", "🔥"):
+        s = s.replace(ch, "")
+    return s.strip()
+
+
+def _parse_md_tables(text: str) -> list:
+    """Yield (kind, content) blocks where kind is 'md' (markdown text) or
+    'table' (a dict with headers and rows lists)."""
+    lines = text.splitlines()
+    blocks = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Detect start of a markdown table: a row of '|...|' followed by a
+        # separator row (---|---|...)
+        if line.lstrip().startswith("|") and i + 1 < len(lines) \
+           and set(lines[i + 1].strip().replace("|", "").replace("-", "").replace(":", "").strip()) <= set():
+            header_cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            data_rows = []
+            j = i + 2
+            while j < len(lines) and lines[j].lstrip().startswith("|"):
+                cells = [c.strip() for c in lines[j].strip().strip("|").split("|")]
+                if len(cells) == len(header_cells):
+                    data_rows.append(cells)
+                j += 1
+            blocks.append(("table", {"headers": header_cells, "rows": data_rows}))
+            i = j
+            continue
+        # Regular markdown line — accumulate
+        buf = [line]
+        i += 1
+        while i < len(lines) and not lines[i].lstrip().startswith("|"):
+            buf.append(lines[i])
+            i += 1
+        blocks.append(("md", "\n".join(buf)))
+    return blocks
+
+
+def _render_smart_markdown(text: str):
+    """Render markdown with color-coded tables. Falls back to st.markdown
+    for any table that has no Color/Verdict column or for non-table prose."""
+    import pandas as pd
+    blocks = _parse_md_tables(text)
+    for kind, content in blocks:
+        if kind == "md":
+            if content.strip():
+                st.markdown(content)
+            continue
+        headers = content["headers"]
+        rows = content["rows"]
+        # Find a colorizer column (case-insensitive on the header label)
+        color_idx = None
+        for idx, h in enumerate(headers):
+            if h.strip().lower() in _VERDICT_COLS:
+                color_idx = idx
+                break
+        if color_idx is None or not rows:
+            # No styling — render as plain markdown
+            md = ["| " + " | ".join(headers) + " |",
+                  "|" + "|".join(["---"] * len(headers)) + "|"]
+            for r in rows:
+                md.append("| " + " | ".join(r) + " |")
+            st.markdown("\n".join(md))
+            continue
+
+        # Build DataFrame, keep verdict column for styling but drop in display
+        df = pd.DataFrame(rows, columns=headers)
+        # Extract uppercase, decoration-stripped verdict value per row
+        verdict_clean = df[headers[color_idx]].astype(str).map(
+            lambda v: _strip_md_inline(v).upper()
+        )
+
+        def _row_style(row):
+            v = verdict_clean.loc[row.name]
+            # Match the first known token
+            for key, bg in _ROW_COLORS.items():
+                if key in v:
+                    return [f"background-color: {bg}; color: #111"] * len(row)
+            return [""] * len(row)
+
+        display = df.drop(columns=[headers[color_idx]])
+        st.dataframe(
+            display.style.apply(_row_style, axis=1),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
+def _render_artifact_page(title: str, filename: str,
+                          empty_hint: str, command_hint: str,
+                          show_title: bool = True, key_prefix: str = ""):
+    """Generic page renderer: date picker + smart markdown view + raw-toggle.
+
+    show_title=False suppresses the st.title (use when embedding inside a tab
+    that already has its own header). key_prefix scopes the selectbox/toggle
+    keys so multiple calls in the same page don't collide.
+    """
+    if show_title:
+        st.title(title)
+    snaps = _list_snapshots_with(filename)
+    if not snaps:
+        st.info(empty_hint)
+        st.code(command_hint, language="bash")
+        return
+    chosen = st.selectbox(
+        "Snapshot date",
+        snaps,
+        index=0,
+        help="Pick a date to view that day's run.",
+        key=f"snap_{key_prefix}_{filename}",
+    )
+    path = DATA_DIR / "snapshots" / chosen / filename
+    text = path.read_text(encoding="utf-8")
+    c2 = st.container()
+    c2.caption(f"File: `{path}`")
+    show_raw = c2.toggle("Show raw markdown source", value=False,
+                         key=f"raw_{key_prefix}_{filename}")
+    if show_raw:
+        st.code(text, language="markdown")
+    else:
+        _render_smart_markdown(text)
+
+
+def _discover_cc_tickers() -> list[str]:
+    """Scan data/snapshots/*/ for files matching <ticker>_roll_flow.md OR
+    <ticker>_trade_ticket.md and return the unique uppercase tickers."""
+    snaps_dir = DATA_DIR / "snapshots"
+    if not snaps_dir.exists():
+        return []
+    found: set[str] = set()
+    for day_dir in snaps_dir.iterdir():
+        if not day_dir.is_dir():
+            continue
+        for f in day_dir.iterdir():
+            name = f.name.lower()
+            for suffix in ("_roll_flow.md", "_trade_ticket.md"):
+                if name.endswith(suffix):
+                    ticker = name[: -len(suffix)].upper()
+                    if ticker:
+                        found.add(ticker)
+                    break
+    return sorted(found)
+
+
+# =============================================================
+# Today's Actions one-pager
+# =============================================================
+
+if page == "Today's Actions":
+    _render_artifact_page(
+        title="Today's Actions",
+        filename="todays_actions.md",
+        empty_hint="No `todays_actions.md` snapshots found yet.",
+        command_hint="python todays_actions.py",
+    )
+
+# =============================================================
+# Trade Ticket — portable execution sheet
+# =============================================================
+
+if page == "Trade Ticket":
+    _render_artifact_page(
+        title="Trade Ticket",
+        filename="trade_ticket.md",
+        empty_hint="No trade ticket yet. Once `cc_income_engine.py` and `cc_buywrite.py` run, "
+                   "a trade ticket can be drafted from their output.",
+        command_hint="# Today's ticket lives at data/snapshots/<date>/trade_ticket.md",
+    )
+
+# =============================================================
+# Covered Calls — consolidated page (engines + per-ticker detail)
+# =============================================================
+
+if page == "Covered Calls":
+    st.title("Covered Calls")
+    st.caption("Income engine, buy-write screener, MSFT wheel, and per-ticker "
+               "roll history + trade tickets — all in one place.")
+
+    cc_tabs = st.tabs([
+        "Income Engine",
+        "Buy-Write Screener",
+        "MSFT Wheel",
+        "Per-Ticker Detail",
+    ])
+
+    with cc_tabs[0]:
+        _render_artifact_page(
+            title="CC Income Engine",
+            filename="cc_income.md",
+            empty_hint="No `cc_income.md` yet — run the engine to generate today's report.",
+            command_hint="python cc_income_engine.py",
+            show_title=False, key_prefix="cc_income",
+        )
+
+    with cc_tabs[1]:
+        _render_artifact_page(
+            title="Buy-Write Screener",
+            filename="cc_buywrite.md",
+            empty_hint="No `cc_buywrite.md` yet — run the screener to surface unowned buy-write candidates.",
+            command_hint="python cc_buywrite.py",
+            show_title=False, key_prefix="cc_buywrite",
+        )
+
+    with cc_tabs[2]:
+        _render_artifact_page(
+            title="MSFT Covered-Call Wheel",
+            filename="msft_income.md",
+            empty_hint="No `msft_income.md` yet — single-name MSFT report.",
+            command_hint="python msft_income.py",
+            show_title=False, key_prefix="msft_wheel",
+        )
+
+    with cc_tabs[3]:
+        tickers = _discover_cc_tickers()
+        if not tickers:
+            st.info("No per-ticker roll history or trade tickets found yet. "
+                    "Files are expected at "
+                    "`data/snapshots/<date>/<ticker>_roll_flow.md` "
+                    "and `data/snapshots/<date>/<ticker>_trade_ticket.md`.")
+        else:
+            chosen_ticker = st.selectbox(
+                "Ticker", tickers, index=0, key="cc_ticker_pick",
+                help="Tickers are auto-discovered from snapshot filenames.",
+            )
+            ticker_lower = chosen_ticker.lower()
+            detail_tabs = st.tabs(["Roll History", "Trade Ticket"])
+            with detail_tabs[0]:
+                _render_artifact_page(
+                    title=f"{chosen_ticker} Roll History",
+                    filename=f"{ticker_lower}_roll_flow.md",
+                    empty_hint=f"No `{ticker_lower}_roll_flow.md` snapshots found for {chosen_ticker}.",
+                    command_hint=f"# See data/snapshots/<date>/{ticker_lower}_roll_flow.md",
+                    show_title=False, key_prefix=f"roll_{ticker_lower}",
+                )
+            with detail_tabs[1]:
+                _render_artifact_page(
+                    title=f"{chosen_ticker} Trade Ticket",
+                    filename=f"{ticker_lower}_trade_ticket.md",
+                    empty_hint=f"No `{ticker_lower}_trade_ticket.md` snapshots found for {chosen_ticker}.",
+                    command_hint=f"# See data/snapshots/<date>/{ticker_lower}_trade_ticket.md",
+                    show_title=False, key_prefix=f"ticket_{ticker_lower}",
+                )
+
+# =============================================================
+# QQQ LEAPS Dip-Buy
+# =============================================================
+
+if page == "QQQ LEAPS Dip-Buy":
+    _render_artifact_page(
+        title="QQQ LEAPS Dip-Buy",
+        filename="qqq_leaps_dipbuy.md",
+        empty_hint="No `qqq_leaps_dipbuy.md` yet — run the engine to generate today's report.",
+        command_hint="python qqq_leaps_dipbuy.py --backtest --years 5",
+    )
+
+# =============================================================
+# LB Backtest — lives in data/backtest/, not in snapshots/
+# =============================================================
+
+if page == "LB Backtest":
+    st.title("LB Backtest")
+    bt_dir = DATA_DIR / "backtest"
+    md_files = sorted(bt_dir.glob("lb_backtest_*.md"), reverse=True) if bt_dir.exists() else []
+    if not md_files:
+        st.info("No backtest runs yet.")
+        st.code("python lb_backtest.py", language="bash")
+    else:
+        labels = [p.stem.replace("lb_backtest_", "") for p in md_files]
+        chosen = st.selectbox("Backtest as-of date", labels, index=0)
+        path = bt_dir / f"lb_backtest_{chosen}.md"
+        st.caption(f"File: `{path}`")
+        if st.toggle("Show raw markdown source", value=False):
+            st.code(path.read_text(encoding="utf-8"), language="markdown")
+        else:
+            st.markdown(path.read_text(encoding="utf-8"))
+
+        # Also surface the JSONL rows as a sortable table
+        jsonl = bt_dir / f"lb_backtest_{chosen}.jsonl"
+        if jsonl.exists():
+            st.subheader("Per-row data")
+            rows = [_json.loads(l) for l in jsonl.read_text(encoding="utf-8").splitlines() if l.strip()]
+            if rows:
+                df = pd.DataFrame(rows)
+                st.dataframe(df, hide_index=True, use_container_width=True)
+
+# =============================================================
+# Glossary — render glossary.md with the smart renderer
+# =============================================================
+
+if page == "Glossary":
+    glossary_path = Path(__file__).parent / "glossary.md"
+    if not glossary_path.exists():
+        st.title("Glossary")
+        st.warning("`glossary.md` not found in repo root.")
+    else:
+        _render_smart_markdown(glossary_path.read_text(encoding="utf-8"))
+
+
+# =============================================================
+# Ticker Analysis — type a ticker, run the full LB multi-agent panel
+# =============================================================
+
+_ACTION_BG = {
+    "BUY":   "#1b5e20", "ADD":   "#1b5e20",
+    "HOLD":  "#5d4037",
+    "TRIM":  "#e65100", "EXIT":  "#b71c1c", "AVOID": "#b71c1c",
+}
+
+def _action_pill(action: str) -> str:
+    bg = _ACTION_BG.get(action.upper(), "#37474f")
+    return (f"<span style='background-color:{bg};color:#fff;"
+            f"padding:6px 14px;border-radius:6px;font-weight:700;"
+            f"font-size:1.1em;letter-spacing:0.5px;'>{action}</span>")
+
+
+TA_HISTORY_DIR = DATA_DIR / "ticker_analysis"
+TA_HISTORY_DIR.mkdir(exist_ok=True, parents=True)
+
+
+def _ta_save_result(ticker: str, result: dict, deep: bool) -> Path:
+    from datetime import datetime as _dt
+    now = _dt.now()
+    day_dir = TA_HISTORY_DIR / now.strftime("%Y-%m-%d")
+    day_dir.mkdir(exist_ok=True, parents=True)
+    fname = f"{ticker}_{now.strftime('%H%M%S')}_{'deep' if deep else 'fast'}.json"
+    path = day_dir / fname
+    payload = {
+        "ticker": ticker,
+        "timestamp": now.isoformat(timespec="seconds"),
+        "deep": deep,
+        "result": result,
+    }
+    path.write_text(_json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return path
+
+
+def _ta_list_history(limit: int = 100) -> list[dict]:
+    rows = []
+    if not TA_HISTORY_DIR.exists():
+        return rows
+    files = sorted(TA_HISTORY_DIR.glob("*/*.json"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in files[:limit]:
+        try:
+            payload = _json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        verdicts = payload.get("result", {}).get("verdicts", [])
+        first = verdicts[0] if verdicts else {}
+        lb = first.get("lb", {}) if isinstance(first, dict) else {}
+        rows.append({
+            "path": p,
+            "ticker": payload.get("ticker") or first.get("ticker") or "?",
+            "timestamp": payload.get("timestamp", ""),
+            "deep": payload.get("deep", False),
+            "action": lb.get("action", "—"),
+            "score": lb.get("final_score"),
+            "confidence": lb.get("confidence"),
+        })
+    return rows
+
+
+def _render_ticker_verdict(v: dict):
+    """Render one LB verdict block from news_to_action.process_message output.
+    Supports both fast (4-agent) and deep (4 + Minervini + Druckenmiller + Burry)
+    modes, plus macro context and research-report presence."""
+    ticker = v.get("ticker", "?")
+    if v.get("error"):
+        st.error(f"**{ticker}** — {v['error']}")
+        return
+
+    if "lb" not in v:
+        st.subheader(ticker)
+        pos = v.get("position", {})
+        if pos.get("held"):
+            st.info(f"Held — {int(pos['shares'])} shares "
+                    f"(${pos['total_value']:,.0f}, "
+                    f"{pos.get('pct_household', 0):.1f}% of household)")
+        else:
+            st.info("Not held.")
+        st.caption("LLM panel skipped — toggle 'Run LLM panel' to get full verdict.")
+        return
+
+    lb = v["lb"]
+    panel = v["panel"]
+    pos = v.get("position", {})
+    spot = v.get("spot")
+    is_deep = v.get("deep", False)
+
+    head_left, head_right = st.columns([3, 2])
+    head_left.subheader(f"{ticker} — ${spot:.2f}" if spot else ticker)
+    head_right.markdown(_action_pill(lb["action"]), unsafe_allow_html=True)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("LB score",     f"{lb['final_score']}/100")
+    k2.metric("Conviction",   f"{lb['confidence']}/10")
+    rs = v.get("rs_rank")
+    k3.metric("RS rank",      f"{rs}" if rs is not None else "—")
+    days_e = v.get("days_to_earnings")
+    k4.metric("Earnings in",  f"{days_e}d" if days_e is not None else "—",
+              help=v.get("earnings_label", ""))
+
+    st.markdown("**Functional panel**")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Technical",   f"{panel['technical']}/100")
+    p2.metric("Fundamental", f"{panel['fundamental']}/100")
+    p3.metric("Sentiment",   f"{panel['sentiment']}/100")
+    p4.metric("Risk",        f"{panel['risk']}/100")
+
+    if is_deep:
+        st.markdown("**Legendary investor lenses**")
+        l1, l2, l3 = st.columns(3)
+        mv = v.get("minervini") or {}
+        dr = v.get("druckenmiller") or {}
+        br = v.get("burry") or {}
+        l1.metric("Minervini (VCP/SEPA)", f"{mv.get('score','—')}/100",
+                  help=f"VCP grade {mv.get('vcp_grade','—')} · stage-2 {mv.get('stage_2_strength','—')}/10 · pocket pivot {mv.get('pocket_pivot_quality','—')}/10")
+        l2.metric("Druckenmiller (macro/theme)", f"{dr.get('score','—')}/100",
+                  help=f"Cycle: {dr.get('cycle_position','—')} · macro {dr.get('macro_alignment','—')}/10 · theme {dr.get('theme_strength','—')}/10")
+        l3.metric("Burry (contrarian/mean-rev)", f"{br.get('score','—')}/100",
+                  help=f"Extension {br.get('extension_risk','—')}/10 · mean-rev prob {br.get('mean_reversion_probability_pct','—')}%")
+
+        m = v.get("macro")
+        theme = v.get("theme_tag")
+        if m or theme:
+            bits = []
+            if m and m.get("label"):
+                if m.get("score") is not None:
+                    bits.append(f"**Macro regime:** {m['label']} ({m['score']:.0f}/100)")
+                else:
+                    bits.append(f"**Macro regime:** {m['label']}")
+            if theme and theme != "neutral":
+                bits.append(f"**Sector/theme:** {theme}")
+            st.caption("  ·  ".join(bits))
+
+        # Forward-looking research block (web search results)
+        research = v.get("research")
+        if research:
+            sentiment = research.get("sentiment", "neutral")
+            sent_color = {"bullish": "#1b5e20", "neutral": "#5d4037", "bearish": "#b71c1c"}.get(sentiment, "#37474f")
+            st.markdown(
+                f"**Forward-looking catalysts** &nbsp;"
+                f"<span style='background-color:{sent_color};color:#fff;padding:3px 10px;"
+                f"border-radius:4px;font-size:0.85em;'>{sentiment.upper()}</span>",
+                unsafe_allow_html=True,
+            )
+            cs = research.get("catalyst_summary")
+            if cs:
+                st.markdown(f"_{cs}_")
+            rd = research.get("recent_developments") or []
+            if rd:
+                st.markdown("**Recent developments (last 30 days):**")
+                for d in rd:
+                    st.markdown(f"- {d}")
+            pc = research.get("pending_catalysts") or []
+            if pc:
+                st.markdown("**Pending catalysts (next 30-60 days):**")
+                for c in pc:
+                    st.markdown(f"- {c}")
+            kr = research.get("key_risks")
+            if kr:
+                st.markdown(f"**Research-level risks:** {kr}")
+            srcs = research.get("sources") or []
+            if srcs:
+                with st.expander(f"Sources ({len(srcs)})"):
+                    for s in srcs:
+                        st.markdown(f"- [{s.get('title','(no title)')}]({s.get('url','')})")
+        elif v.get("research_error"):
+            st.caption(f"⚠ Research call failed: {v['research_error']}")
+        else:
+            st.caption("No research report — LB ran without web-research context.")
+
+        with st.expander("Lens summaries (Minervini / Druckenmiller / Burry)"):
+            if mv.get("summary"):
+                st.markdown(f"**Minervini.** {mv['summary']}")
+            if dr.get("summary"):
+                st.markdown(f"**Druckenmiller.** {dr['summary']}")
+            if br.get("summary"):
+                st.markdown(f"**Burry.** {br['summary']}")
+
+    sigs = v.get("signals_fired") or []
+    if sigs:
+        st.markdown("**Signals fired:** " + "  ".join(f"`{s.upper()}`" for s in sigs))
+
+    st.markdown(f"**Thesis.** {lb['thesis']}")
+    st.markdown(f"**Key risk.** {lb['key_risk']}")
+    st.markdown(f"**Sizing.** {lb['sizing_note']}")
+
+    if pos.get("held"):
+        rows = []
+        for a in pos.get("accounts", []):
+            rows.append({"Account": a["label"], "Shares": int(a["shares"]),
+                         "Value": f"${a['value']:,.0f}"})
+        pct = pos.get("pct_household")
+        held_caption = f"Held in {len(rows)} account(s)"
+        if pct is not None:
+            held_caption += f" — {pct:.1f}% of household"
+        if pos.get("locked"):
+            held_caption += " — LOCKED"
+        st.markdown(f"**{held_caption}**")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    else:
+        st.caption("Not held.")
+
+    bw = v.get("buywrite_alt")
+    if bw:
+        st.markdown("**Buy-write alternative (own + write call):**")
+        st.markdown(
+            f"Strike **${int(bw['strike'])}**, expiry **{bw['expiry']}** ({bw['dte']} DTE) — "
+            f"premium ${bw['premium']:.2f}, annualized yield "
+            f"{bw['annualized_yield_pct']:.1f}%, adjusted probability of profit "
+            f"{bw['adj_pop']:.0f}% — **{bw['verdict']}**. "
+            f"Cost per contract ≈ ${bw['cost_per_contract']:,.0f}."
+        )
+
+
+if page == "Ticker Analysis":
+    st.title("Ticker Analysis")
+    st.caption(
+        "Type a ticker — DEEP mode runs the full intel stack: "
+        "Technical · Fundamental · Sentiment · Risk · "
+        "**Minervini (VCP/SEPA)** · **Druckenmiller (macro/theme)** · **Burry (contrarian)** · "
+        "+ macro regime + cached research + LB Portfolio Manager synthesizer. "
+        "Cost ≈ $0.04 deep / $0.025 fast per ticker."
+    )
+
+    col_t, col_d, col_l, col_b = st.columns([2, 1, 1, 1])
+    raw_input = col_t.text_input(
+        "Ticker symbol",
+        value="",
+        placeholder="e.g. INTC, NBIS, AAPL, $TSLA",
+        key="ta_ticker_input",
+    )
+    ticker = raw_input.strip().upper().lstrip("$")
+    deep_mode = col_d.checkbox(
+        "Deep panel", value=True,
+        help="On = 7 agents + macro + research. Off = 4 agents + LB only.",
+    )
+    run_llm = col_l.checkbox(
+        "Run LLM", value=True,
+        help="Off = position context + signals only, no LLM tokens.",
+    )
+    want_buywrite = col_b.checkbox(
+        "Buy-write alt", value=True,
+        help="If not held and panel says BUY/ADD, also fetch a buy-write candidate.",
+    )
+
+    run_clicked = st.button(
+        "Run analysis", type="primary", disabled=not ticker,
+        use_container_width=False,
+    )
+
+    if run_clicked and ticker:
+        spinner_msg = f"Analyzing {ticker} — {'deep' if deep_mode else 'fast'} panel..."
+        with st.spinner(spinner_msg):
+            try:
+                from news_to_action import process_message
+                result = process_message(
+                    f"${ticker}",
+                    run_llm=run_llm,
+                    want_buywrite=want_buywrite,
+                    deep=deep_mode and run_llm,
+                )
+                saved = _ta_save_result(ticker, result, deep=deep_mode and run_llm)
+                st.session_state["ta_result"] = result
+                st.session_state["ta_last_ticker"] = ticker
+                st.session_state["ta_last_saved"] = str(saved)
+            except Exception as e:
+                st.error(f"Analysis failed: {e}")
+                st.session_state.pop("ta_result", None)
+
+    # ---- History panel ----
+    st.divider()
+    hist = _ta_list_history(limit=200)
+    if hist:
+        with st.expander(f"Analysis history ({len(hist)} runs)", expanded=False):
+            hist_df = pd.DataFrame([{
+                "When": h["timestamp"],
+                "Ticker": h["ticker"],
+                "Mode": "deep" if h["deep"] else "fast",
+                "Action": h["action"],
+                "LB score": h["score"],
+                "Conviction": h["confidence"],
+                "File": h["path"].name,
+            } for h in hist])
+            st.dataframe(hist_df, hide_index=True, use_container_width=True)
+
+            options = [f"{h['timestamp']} — {h['ticker']} ({'deep' if h['deep'] else 'fast'}) → {h['action']}"
+                       for h in hist]
+            pick_col, btn_col = st.columns([4, 1])
+            choice = pick_col.selectbox("Pick a prior analysis to reload",
+                                        options, index=0, key="ta_history_pick")
+            load_clicked = btn_col.button("Load", use_container_width=True,
+                                          key="ta_history_load")
+            if load_clicked and choice:
+                idx = options.index(choice)
+                try:
+                    payload = _json.loads(hist[idx]["path"].read_text(encoding="utf-8"))
+                    st.session_state["ta_result"] = payload.get("result", {})
+                    st.session_state["ta_last_ticker"] = payload.get("ticker", "")
+                    st.session_state["ta_last_saved"] = str(hist[idx]["path"])
+                    st.success(f"Loaded {hist[idx]['ticker']} from {hist[idx]['timestamp']}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not reload: {e}")
+    else:
+        st.caption("No analyses saved yet — they'll appear here after your first run.")
+
+    # ---- Current/loaded result ----
+    result = st.session_state.get("ta_result")
+    if result:
+        last = st.session_state.get("ta_last_ticker", "")
+        saved_path = st.session_state.get("ta_last_saved", "")
+        st.caption(f"Showing: **{last}**" + (f" · saved to `{saved_path}`" if saved_path else ""))
+
+        if not result.get("tickers"):
+            st.warning(result.get("warning", "No tickers were extracted from the input."))
+        else:
+            for v in result["verdicts"]:
+                st.divider()
+                _render_ticker_verdict(v)
+
+        with st.expander("Show raw JSON result"):
+            st.json(result)
+    else:
+        st.info("Enter a ticker and click **Run analysis** to start.")

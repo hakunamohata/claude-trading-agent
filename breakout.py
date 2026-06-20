@@ -40,6 +40,48 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 # ---------- Feature engineering ----------
 
+def compute_ad_score(df: pd.DataFrame, lookback: int = 65) -> pd.Series:
+    """IBD-style Accumulation/Distribution score.
+
+    For each bar t, computes the rolling N-day A/D score (default 65 = ~13 weeks):
+        buying_pressure  = sum of (close - prior_close) * volume on up days
+        selling_pressure = sum of |close - prior_close| * volume on down days
+        ad_score        = (buying - selling) / (buying + selling)
+
+    Range: [-1, +1]. Letter-grade thresholds (see `ad_label`):
+        >= +0.30  "A"  heavy accumulation
+        >= +0.10  "B"  mild accumulation
+        >= -0.10  "C"  neutral
+        >= -0.30  "D"  mild distribution
+        <  -0.30  "E"  heavy distribution
+
+    Weights each day's contribution by |price change| * volume — so a tiny
+    drift up on huge volume contributes less than a strong up close on equal
+    volume. This is the standard Wyckoff/IBD effort-vs-result formulation.
+
+    Computed using only data through bar t (no look-ahead).
+    """
+    c = df["close"]
+    v = df["volume"]
+    change = c - c.shift(1)
+    dollar_vol = change * v
+    buy = dollar_vol.where(change > 0, 0).rolling(lookback).sum()
+    sell = (-dollar_vol).where(change < 0, 0).rolling(lookback).sum()
+    denom = (buy + sell).replace(0, np.nan)
+    return (buy - sell) / denom
+
+
+def ad_label(score) -> str:
+    """Map A/D score to IBD-style letter grade. Returns '?' for NaN."""
+    if pd.isna(score):
+        return "?"
+    if score >= 0.30: return "A"
+    if score >= 0.10: return "B"
+    if score >= -0.10: return "C"
+    if score >= -0.30: return "D"
+    return "E"
+
+
 def compute_universe_rs_rank(
     closes: dict[str, pd.Series],
     weights: dict[int, float] | None = None,
@@ -82,6 +124,10 @@ def build_features(
     out["atr_pct"] = out["atr_14"] / c
 
     out["vol_avg_50"] = out["volume"].rolling(50).mean()
+
+    # IBD-style A/D score (13-week accumulation/distribution). Distinguishes
+    # quiet drift-up (low A/D) from real institutional accumulation (high A/D).
+    out["ad_score_65"] = compute_ad_score(out, lookback=65)
 
     # Prior N-day high — shift(1) so today's high doesn't count against itself.
     out["high_50_prior"] = out["high"].rolling(50).max().shift(1)

@@ -149,10 +149,9 @@ def evaluate_ticker(date: str, ticker: str, payload: dict,
     client = _get_client()
     user_content = f"Ticker: {ticker}\nDate: {date}\n\nCandidate data:\n{json.dumps(payload, indent=2, default=str)}"
 
-    response = client.messages.parse(
+    kwargs = dict(
         model=MODEL,
         max_tokens=2048,
-        thinking={"type": "adaptive"},
         system=[{
             "type": "text",
             "text": SYSTEM_PROMPT,
@@ -161,6 +160,9 @@ def evaluate_ticker(date: str, ticker: str, payload: dict,
         messages=[{"role": "user", "content": user_content}],
         output_format=TickerJudgment,
     )
+    if "haiku" not in MODEL.lower() and "sonnet-4-5" not in MODEL.lower():
+        kwargs["thinking"] = {"type": "adaptive"}
+    response = client.messages.parse(**kwargs)
 
     judgment = response.parsed_output
     save_judgment(date, ticker, payload, judgment)

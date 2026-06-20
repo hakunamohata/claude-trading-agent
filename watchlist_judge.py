@@ -10,6 +10,7 @@ CLI:
 """
 
 from __future__ import annotations
+import os
 import sys
 import json
 from datetime import datetime
@@ -27,6 +28,7 @@ from multi_agent import evaluate_full
 from wide_universe import build_wide_universe
 from universe import TICKER_TO_SECTOR
 from portfolio import HOLDINGS_DIR, ACCOUNT_LABEL, TRADE_ELIGIBLE_ACCOUNTS, LOCKED_POSITIONS
+import scratchpad
 
 
 def run(top_n: int = 10) -> list[dict]:
@@ -35,6 +37,15 @@ def run(top_n: int = 10) -> list[dict]:
     if wl is None or wl.empty:
         print("No watchlist found. Run scanner.py first.")
         return []
+
+    run_id = scratchpad.start_run(
+        kind="watchlist_judge",
+        args={
+            "top_n": top_n,
+            "model": os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7"),
+        },
+    )
+    print(f"Scratchpad run: {run_id}")
 
     top = wl.head(top_n).copy()
     print(f"Loaded watchlist top {len(top)} from snapshot {today}")
@@ -129,6 +140,12 @@ def run(top_n: int = 10) -> list[dict]:
         print(f"  RISK:   {pm['key_risk']}")
         print(f"  SIZING: {pm['sizing_note']}")
         print()
+
+    manifest = scratchpad.end_run()
+    if manifest:
+        print(f"Scratchpad: {manifest['calls']} calls, "
+              f"{manifest['input_tokens']:,} in + {manifest['output_tokens']:,} out tokens, "
+              f"est ${manifest['est_cost_usd']:.3f} -> {manifest['jsonl_path']}")
     return results
 
 

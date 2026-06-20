@@ -77,6 +77,9 @@ _DEFAULT_TICKER_TO_SECTOR = {
     # Semis / AI infra
     "NVDA": "SOXX", "AMD": "SOXX", "MU": "SOXX", "MRVL": "SOXX",
     "AVGO": "SOXX", "SNDK": "SOXX", "ALAB": "SOXX", "NBIS": "SOXX",
+    "INTC": "SOXX", "TSM": "SOXX", "ASML": "SOXX", "ARM": "SOXX",
+    "QCOM": "SOXX", "LRCX": "SOXX", "AMAT": "SOXX", "KLAC": "SOXX",
+    "ON": "SOXX", "MCHP": "SOXX", "ADI": "SOXX", "TXN": "SOXX",
     # Mega-cap tech / software
     "AAPL": "XLK", "MSFT": "XLK",
     # Communication services

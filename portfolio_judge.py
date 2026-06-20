@@ -14,9 +14,18 @@ CLI:
 """
 
 from __future__ import annotations
+import os
 import sys
+import io
 from datetime import datetime
 import pandas as pd
+
+# Force UTF-8 on Windows console so we can print unicode chars like −, →, etc.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 from data_fetch import fetch_many
 from breakout import (
@@ -30,6 +39,7 @@ from universe import ALL_TICKERS, BENCHMARK, SECTOR_ETFS, TICKER_TO_SECTOR
 from portfolio import (
     HOLDINGS_DIR, ACCOUNT_LABEL, TRADE_ELIGIBLE_ACCOUNTS, LOCKED_POSITIONS,
 )
+import scratchpad
 
 
 NON_EQUITY = {"FDRXX", "SPAXX", "NHFSMKX98", "CASH_ROTH", "CASH_TOD", "CASH_HSA"}
@@ -53,9 +63,41 @@ THEME_BY_SECTOR_ETF = {
 }
 
 
+def _load_existing_judgments() -> dict[tuple, dict]:
+    """Return existing judgments_portfolio.jsonl entries keyed by (ticker, account)."""
+    from data_fetch import DATA_DIR
+    p = DATA_DIR / "snapshots" / datetime.now().strftime("%Y-%m-%d") / "judgments_portfolio.jsonl"
+    if not p.exists():
+        return {}
+    out = {}
+    import json as _j
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = _j.loads(line)
+            out[(r["ticker"], r["account"])] = r
+        except Exception:
+            continue
+    return out
+
+
 def run(include_investor_agents: bool = False,
         with_research: bool = False,
-        research_refresh: bool = False) -> list[dict]:
+        research_refresh: bool = False,
+        missing_only: bool = False) -> list[dict]:
+    run_id = scratchpad.start_run(
+        kind="portfolio_judge",
+        args={
+            "investor_agents": include_investor_agents,
+            "with_research": with_research,
+            "research_refresh": research_refresh,
+            "missing_only": missing_only,
+            "model": os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7"),
+        },
+    )
+    print(f"Scratchpad run: {run_id}")
+
     pf = pd.read_parquet(HOLDINGS_DIR / "positions_current.parquet")
     pf_total = float(pf["value"].sum())
 
@@ -67,8 +109,14 @@ def run(include_investor_agents: bool = False,
     flags = []
     if include_investor_agents: flags.append("+investor agents")
     if with_research: flags.append("+live research")
+    if missing_only: flags.append("missing-only mode")
     flag_str = f"  ({', '.join(flags)})" if flags else ""
     print(f"Multi-agent on {len(work)} positions (total household ${pf_total:,.0f}){flag_str}")
+
+    # Preserve existing entries if missing_only
+    existing = _load_existing_judgments() if missing_only else {}
+    if existing:
+        print(f"  Found {len(existing)} existing judgments — will preserve them and only score new tickers.")
 
     # Macro regime is needed when investor agents are on (Druckenmiller uses it)
     macro_score = None
@@ -97,9 +145,18 @@ def run(include_investor_agents: bool = False,
 
     print(f"Scoring (date: {latest.date()})\n")
     results = []
+    skipped_existing = 0
     for _, row in work.iterrows():
         t = row["ticker"]
         acct = row["account_id"]
+        acct_label_short = ACCOUNT_LABEL.get(acct, acct)
+
+        # Skip if already done (missing_only mode)
+        if existing and (t, acct_label_short) in existing:
+            results.append(existing[(t, acct_label_short)])
+            skipped_existing += 1
+            continue
+
         if t not in raw or latest not in raw[t].index:
             print(f"  ! {t}: no data")
             continue
@@ -163,7 +220,9 @@ def run(include_investor_agents: bool = False,
             print(f"  ! {t}: {e}")
 
     save_jsonl("judgments_portfolio", results)
-    print(f"\nWrote {len(results)} judgments to data/snapshots/{datetime.now().strftime('%Y-%m-%d')}/judgments_portfolio.jsonl")
+    fresh = len(results) - skipped_existing
+    print(f"\nWrote {len(results)} judgments ({fresh} freshly scored, {skipped_existing} preserved from prior run) "
+          f"to data/snapshots/{datetime.now().strftime('%Y-%m-%d')}/judgments_portfolio.jsonl")
 
     # Summary by LB action
     print("\n=== SUMMARY BY ACTION ===")
@@ -186,6 +245,12 @@ def run(include_investor_agents: bool = False,
             print(f"    {pm['thesis']}")
             print(f"    SIZING: {pm['sizing_note']}")
 
+    manifest = scratchpad.end_run()
+    if manifest:
+        print(f"\nScratchpad: {manifest['calls']} calls, "
+              f"{manifest['input_tokens']:,} in + {manifest['output_tokens']:,} out tokens, "
+              f"est ${manifest['est_cost_usd']:.3f} -> {manifest['jsonl_path']}")
+
     return results
 
 
@@ -194,8 +259,10 @@ if __name__ == "__main__":
     include_investor = "--investor-agents" in args
     with_research = "--with-research" in args
     research_refresh = "--refresh" in args
+    missing_only = "--missing-only" in args
     run(
         include_investor_agents=include_investor,
         with_research=with_research,
         research_refresh=research_refresh,
+        missing_only=missing_only,
     )

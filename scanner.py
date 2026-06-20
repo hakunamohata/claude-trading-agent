@@ -30,7 +30,7 @@ import numpy as np
 from data_fetch import fetch_many
 from breakout import (
     build_features, any_breakout_signal, signal_components,
-    compute_universe_rs_rank,
+    compute_universe_rs_rank, ad_label,
 )
 from wide_universe import build_wide_universe
 from snapshot import save_df, write_manifest
@@ -112,18 +112,36 @@ def _score_prebreakout(feat_row, sig_row, comp_row) -> float:
 
 
 def _score_volume(feat_row) -> float:
-    """Up-day volume vs avg + light pre-breakout volume (VDU)."""
+    """Volume signature — A/D dominant, intraday pattern secondary.
+
+    70% of the score comes from the 13-week A/D ratio (real institutional
+    accumulation proxy). 30% comes from today's volume pattern (VDU dry-up
+    or active accumulation). A name making ATH on light volume with weak A/D
+    scores low here; a name accumulating on hot volume scores high.
+    """
+    score = 0.0
+
+    # A/D primary (70% of this component)
+    ad = feat_row.get("ad_score_65")
+    if pd.notna(ad):
+        # Map [-1, +1] -> [0, 1]
+        score += 0.7 * (float(ad) + 1) / 2
+    else:
+        score += 0.35  # missing -> neutral
+
+    # Intraday volume pattern (30% of this component)
     vol_x = feat_row["volume"] / feat_row["vol_avg_50"] if feat_row.get("vol_avg_50") else None
     if vol_x is None:
-        return 0.0
-    # Volume dry-up immediately before a breakout is constructive
-    if 0.5 <= vol_x <= 0.9:
-        return 0.5  # VDU pattern
-    if vol_x >= 1.2:
-        return 0.7  # active accumulation
-    if vol_x >= 1.0:
-        return 0.4
-    return 0.2
+        score += 0.15
+    elif 0.5 <= vol_x <= 0.9:
+        score += 0.30  # VDU
+    elif vol_x >= 1.2:
+        score += 0.30  # active accumulation
+    elif vol_x >= 1.0:
+        score += 0.20
+    else:
+        score += 0.10
+    return min(1.0, score)
 
 
 def _score_setup(feat_row, sig_row, comp_row, close_series) -> dict:
@@ -173,7 +191,9 @@ def run_scan(top_n: int = 30, refresh_data: bool = False) -> pd.DataFrame:
     equity_closes = {t: df["close"] for t, df in raw.items() if t != BENCHMARK}
     rs_rank_df = compute_universe_rs_rank(equity_closes)
 
-    latest_date = max(df.index[-1] for df in raw.values())
+    # Anchor to benchmark's last settled bar — avoids a single ticker's stray
+    # intraday bar (NaN close gets dropped earlier) from disqualifying everything.
+    latest_date = raw[BENCHMARK].index[-1]
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Scoring on bar {latest_date.date()}...")
 
     rows = []
@@ -223,6 +243,9 @@ def run_scan(top_n: int = 30, refresh_data: bool = False) -> pd.DataFrame:
             "ema_200": round(float(feat_row["ema_200"]), 2),
             "volume_x": round(float(feat_row["volume"] / feat_row["vol_avg_50"]), 2)
                 if feat_row.get("vol_avg_50") else None,
+            "ad_score": round(float(feat_row["ad_score_65"]), 2)
+                if pd.notna(feat_row.get("ad_score_65")) else None,
+            "ad_grade": ad_label(feat_row.get("ad_score_65")),
             # Score component breakdown
             "score_clean_base": round(parts["clean_base"], 2),
             "score_rs_strength": round(parts["rs_strength"], 2),
@@ -255,7 +278,7 @@ if __name__ == "__main__":
     watchlist = run_scan(top_n=top_n, refresh_data=refresh)
     print(f"\n=== TOP {top_n} WATCHLIST ===\n")
     cols = ["ticker", "score", "close", "rs_rank", "rs_60_pct", "signal_fired", "signal_mode",
-            "vcp_conditions", "stage_2", "volume_x"]
+            "vcp_conditions", "stage_2", "volume_x", "ad_grade", "ad_score"]
     print(watchlist[cols].to_string(index=False))
 
     # Persist to snapshot

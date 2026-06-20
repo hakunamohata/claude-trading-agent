@@ -66,7 +66,7 @@ def diff_against_yesterday(today_df: pd.DataFrame) -> dict:
                 "dte": row["dte"],
                 "moneyness_pct": row["moneyness_pct"],
                 "current_mid": row["current_mid"],
-                "pnl": row["total_pnl_usd"],
+                "pnl": row["current_contract_pnl_usd"],
             })
 
         # Approaching strike — within 5% of being ITM
@@ -99,7 +99,7 @@ def diff_against_yesterday(today_df: pd.DataFrame) -> dict:
                         "change_pts": round(iv_change, 1),
                     })
                 # Theta collected = change in P&L attributable to time decay
-                pnl_change = row["total_pnl_usd"] - p["total_pnl_usd"]
+                pnl_change = row["current_contract_pnl_usd"] - p["current_contract_pnl_usd"]
                 alerts["theta_collected"].append({
                     "position": f"{row['ticker']} {row['strike']:.0f}{row['type'][0]}",
                     "pnl_change_today_usd": int(pnl_change),
@@ -113,7 +113,7 @@ def diff_against_yesterday(today_df: pd.DataFrame) -> dict:
 def format_alerts_text(alerts: dict, today_df: pd.DataFrame) -> str:
     """Human-readable summary of state + alerts."""
     lines = []
-    total_pnl = int(today_df["total_pnl_usd"].sum()) if not today_df.empty else 0
+    total_pnl = int(today_df["current_contract_pnl_usd"].sum()) if not today_df.empty else 0
     daily_theta = int(-today_df["theta_per_day"].sum()) if not today_df.empty else 0
     lines.append(f"OPTIONS BOOK — {len(today_df)} positions, total open P&L ${total_pnl:,}")
     lines.append(f"Theta collected daily: ${daily_theta:,}/day  (from selling premium)")

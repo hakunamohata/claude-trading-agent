@@ -20,6 +20,7 @@ Cost: ~5 × $0.005 = ~$0.025 per ticker. 30-name watchlist = ~$0.75 per full sca
 
 from __future__ import annotations
 import os
+import time
 from typing import Literal
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -27,6 +28,8 @@ import anthropic
 from dotenv import load_dotenv
 
 from data_fetch import DATA_DIR
+from breakout import ad_label
+import scratchpad
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -45,7 +48,7 @@ class TechnicalReport(BaseModel):
     signal_quality: int = Field(ge=0, le=10)
     rs_quality: int = Field(ge=0, le=10)
     trend_health: int = Field(ge=0, le=10)
-    summary: str = Field(max_length=240)
+    summary: str = Field(max_length=1500)
 
 
 class FundamentalReport(BaseModel):
@@ -53,7 +56,7 @@ class FundamentalReport(BaseModel):
     earnings_safety: int = Field(ge=0, le=10, description="10 = no earnings risk near term")
     sector_tailwind: int = Field(ge=0, le=10)
     catalyst_potential: int = Field(ge=0, le=10)
-    summary: str = Field(max_length=240)
+    summary: str = Field(max_length=1500)
 
 
 class SentimentReport(BaseModel):
@@ -61,7 +64,7 @@ class SentimentReport(BaseModel):
     accumulation_signature: int = Field(ge=0, le=10)
     momentum_strength: int = Field(ge=0, le=10)
     extension_safety: int = Field(ge=0, le=10, description="10 = not extended, room to run")
-    summary: str = Field(max_length=240)
+    summary: str = Field(max_length=1500)
 
 
 class RiskReport(BaseModel):
@@ -69,7 +72,7 @@ class RiskReport(BaseModel):
     concentration_risk: int = Field(ge=0, le=10, description="0 = severe concentration, 10 = fine")
     correlation_risk: int = Field(ge=0, le=10)
     position_size_risk: int = Field(ge=0, le=10)
-    summary: str = Field(max_length=240)
+    summary: str = Field(max_length=1500)
 
 
 class MinerviniReport(BaseModel):
@@ -79,7 +82,7 @@ class MinerviniReport(BaseModel):
     stage_2_strength: int = Field(ge=0, le=10)
     pocket_pivot_quality: int = Field(ge=0, le=10)
     entry_proximity: int = Field(ge=0, le=10, description="10 = at the pivot, 0 = no entry yet")
-    summary: str = Field(max_length=240)
+    summary: str = Field(max_length=1500)
 
 
 class DruckenmillerReport(BaseModel):
@@ -89,7 +92,7 @@ class DruckenmillerReport(BaseModel):
     theme_strength: int = Field(ge=0, le=10, description="AI infra / memory cycle / etc strength")
     sector_leadership: int = Field(ge=0, le=10)
     cycle_position: Literal["early", "mid", "late", "exhausted"]
-    summary: str = Field(max_length=240)
+    summary: str = Field(max_length=1500)
 
 
 class BurryReport(BaseModel):
@@ -98,7 +101,7 @@ class BurryReport(BaseModel):
     extension_risk: int = Field(ge=0, le=10, description="10 = severely extended, prime for reversion")
     rs_divergence_risk: int = Field(ge=0, le=10, description="10 = RS rolling over while price still up")
     mean_reversion_probability_pct: int = Field(ge=0, le=100)
-    summary: str = Field(max_length=240)
+    summary: str = Field(max_length=1500)
 
 
 class PortfolioManagerVerdict(BaseModel):
@@ -106,9 +109,9 @@ class PortfolioManagerVerdict(BaseModel):
     bias: Literal["strong_long", "long", "watch", "trim", "avoid"]
     action: Literal["BUY", "ADD", "HOLD", "TRIM", "EXIT", "AVOID"]
     confidence: int = Field(ge=1, le=10)
-    thesis: str = Field(max_length=280)
-    key_risk: str = Field(max_length=280)
-    sizing_note: str = Field(max_length=240, description="Position-sizing guidance vs current")
+    thesis: str = Field(max_length=600)
+    key_risk: str = Field(max_length=600)
+    sizing_note: str = Field(max_length=600, description="Position-sizing guidance vs current")
 
 
 class MultiAgentResult(BaseModel):
@@ -176,13 +179,20 @@ Inputs you receive:
 - Pocket pivot (today's volume > max down-day volume of prior 10 days)
 - Top-third-of-range close (closing strength)
 - 9/21 SMA cloud state (bullish/bearish)
+- **A/D score (13-week Accumulation/Distribution)** — KEY institutional flow signal:
+    `ad_grade_13w`: A (heavy accumulation), B (mild), C (neutral), D (mild distribution), E (heavy)
+    `ad_score_13w`: raw ratio -1 to +1
+  This is the highest-quality flow signal available. Weight `accumulation_signature` heavily off it.
 
 Reward:
-  - Accumulation: VDU before breakout, pocket pivot inside base
+  - A/D grade A or B (institutional accumulation over 13 weeks)
+  - VDU before breakout, pocket pivot inside base
   - Up-day on 1.5x+ volume = institutional bid
   - Bullish cloud regime
 
 Penalize:
+  - A/D grade D or E (distribution — sellers in control over 13 weeks)
+  - **A/D-vs-price divergence**: price at/near highs but A/D grade C/D/E = "rallying on fumes," NOT confirmed by flow
   - Extended above 50 EMA (extension risk)
   - Light volume on supposed breakouts (not confirmed)
   - Bearish cloud regime
@@ -214,16 +224,16 @@ Score 0-100. Be terse. JSON only."""
 
 SYSTEM_MINERVINI = """You are the Mark Minervini investor agent. Your lens: SEPA (Specific Entry Point Analysis) + VCP (Volatility Contraction Pattern) + Stage 2 leadership + pocket pivots.
 
-You see ONLY: VCP/PP signals, Stage 2 confirmation, EMA structure, RS rank, volume signature, extension percent above 50 EMA.
+You see ONLY: VCP/PP signals, Stage 2 confirmation, EMA structure, RS rank, volume signature, extension percent above 50 EMA, A/D grade (13-week accumulation/distribution).
 
 Score 0-100 on SEPA conviction:
   - vcp_grade: A=textbook quiet base + tight contraction, B=decent base, C=loose/wide, D=no real base, F=in a downtrend
   - stage_2_strength: 50EMA>200EMA, both rising, price respecting 21 EMA on pullbacks (10 = perfect)
-  - pocket_pivot_quality: up-day volume vs max down-day volume of prior 10 (10 = clear institutional print)
+  - pocket_pivot_quality: up-day volume vs max down-day volume of prior 10 (10 = clear institutional print). Use `ad_grade_13w` as confirming context: pocket pivots in A/B accumulation regimes are MUCH stronger than the same pattern in C/D distribution regimes.
   - entry_proximity: how close to a clean entry pivot (10 = at the pivot, 0 = far/extended)
 
-Penalize: extension >25% above 50 EMA (no entry), no Stage 2, weak RS rank (<70).
-Reward: tight contraction + RS rank >85 + pocket pivot + entry at 21/50 EMA.
+Penalize: extension >25% above 50 EMA (no entry), no Stage 2, weak RS rank (<70), A/D grade D or E (Minervini explicitly avoids names being distributed).
+Reward: tight contraction + RS rank >85 + pocket pivot + entry at 21/50 EMA + A/D grade A or B (institutional sponsorship confirmed).
 
 Be terse, factual. JSON only."""
 
@@ -246,15 +256,17 @@ Be terse. JSON only."""
 
 SYSTEM_BURRY = """You are the Michael Burry contrarian investor agent. Your lens: where's the over-extension, where's the divergence, what's likely to mean-revert.
 
-You see ONLY: extension percent above 50/200 EMAs, RS rank trajectory, recent N-day return magnitude, volume on rallies vs pullbacks.
+You see ONLY: extension percent above 50/200 EMAs, RS rank trajectory, recent N-day return magnitude, volume on rallies vs pullbacks, A/D grade (13-week accumulation/distribution).
 
 Score 0-100 on CONTRARIAN conviction (higher = stronger signal to AVOID or WAIT):
   - extension_risk: 10 = severely extended (40%+ above 50EMA), prime mean-reversion candidate; 0 = at the 50 EMA, healthy
   - rs_divergence_risk: 10 = RS rolling over while price still up (classic distribution); 0 = RS confirming
   - mean_reversion_probability_pct: rough probability stock pulls back 15%+ within 30 days
 
-Reward (low score): names at the 50 EMA after a healthy pullback with RS holding up.
-Penalize (high score): parabolic moves, +40% in last 30 days, RS divergence, light-volume rallies.
+CRITICAL signal — **A/D-vs-price divergence**: if price is up >20% in 30d AND `ad_grade_13w` is C/D/E, that's the textbook distribution-into-strength pattern Burry hunts. Bump rs_divergence_risk and mean_reversion_probability sharply when this fires. Conversely, A/D grade A on a name that just sold off violently is a CONTRARIAN BUY signal (Burry's "value when no one's looking") — score should go DOWN (less avoid).
+
+Reward (low score): names at the 50 EMA after a healthy pullback with RS holding up, A/D grade A/B confirming flow.
+Penalize (high score): parabolic moves, +40% in last 30 days, RS divergence, light-volume rallies, A/D grade D/E while price near highs.
 
 Burry would say: "the best entry is when everyone hates the name and it's bottoming, not when CNBC is talking about it." Score with that bias.
 
@@ -270,6 +282,8 @@ You must NOT just average their scores. Weigh them by quality:
   - If Risk flags concentration, even a 90 Technical doesn't justify ADD — recommend TRIM
   - If Fundamental flags earnings in 7 days, downgrade BUY to HOLD until after earnings
   - If all functional specialists (Tech/Fund/Sent/Risk) are 70+ AND position is under 5%, ADD or BUY is justified
+  - **A/D-confirmed setups get a sizing boost**: when Sentiment notes A/D grade A or B + Technical sees a fired signal, this is the highest-quality buy signal possible — institutional flow IS the setup.
+  - **A/D-distribution overrides bullish chart action**: if Sentiment (and Minervini, if present) flag A/D grade D or E on a name that looks technically OK, treat this as institutional selling-into-strength — downgrade BUY to HOLD, HOLD to TRIM. Charts lie; 13-week flow doesn't.
   - When investor philosophy agents are included:
     * Minervini high (80+) + entry_proximity 8+ confirms a buyable setup
     * Druckenmiller flags "late" or "exhausted" cycle position → downgrade BUY toward HOLD
@@ -283,6 +297,11 @@ Actions:
   TRIM   — reduce position size (concentration or weakening setup)
   EXIT   — close position entirely (broken trend or persistent weakness)
   AVOID  — would not initiate, would not add
+
+HARD POSITION RULE — read `current_position_value_usd` before deciding:
+  - If `current_position_value_usd == 0` (NOT held), the ONLY valid actions are BUY (if conviction is high) or AVOID. NEVER return HOLD, TRIM, ADD, or EXIT for a name the user does not own — those actions presuppose an existing position.
+  - If `current_position_value_usd > 0` (held), valid actions are HOLD / ADD / TRIM / EXIT. AVOID is only valid for unowned names.
+  - Treat this as a constraint, not a guideline.
 
 Be terse. thesis = 1 sentence WHY, key_risk = 1 sentence WHAT could break this. sizing_note = how much to trade (e.g., "trim 30% of position", "add 1/3 size on a pullback to 50 EMA"). JSON only."""
 
@@ -301,15 +320,20 @@ def _get_client():
     return _client
 
 
-def _call_agent(system_prompt: str, user_payload: dict, schema: type[BaseModel]) -> BaseModel:
-    """One Claude call with adaptive thinking + cached system prompt + Pydantic output."""
+def _call_agent(system_prompt: str, user_payload: dict, schema: type[BaseModel],
+                role: str = "unknown") -> BaseModel:
+    """One Claude call with cached system prompt + Pydantic output.
+
+    Uses adaptive thinking on Opus/Sonnet models that support it; omits it on
+    Haiku (which errors on the parameter). When a scratchpad run is active,
+    logs the call (payload, output, tokens, latency).
+    """
     client = _get_client()
     import json
     user_content = f"Candidate:\n{json.dumps(user_payload, indent=2, default=str)}"
-    response = client.messages.parse(
+    kwargs = dict(
         model=MODEL,
         max_tokens=1024,
-        thinking={"type": "adaptive"},
         system=[{
             "type": "text",
             "text": system_prompt,
@@ -318,6 +342,28 @@ def _call_agent(system_prompt: str, user_payload: dict, schema: type[BaseModel])
         messages=[{"role": "user", "content": user_content}],
         output_format=schema,
     )
+    # Adaptive thinking only on models that support it (Opus 4.6+, Sonnet 4.6)
+    if "haiku" not in MODEL.lower() and "sonnet-4-5" not in MODEL.lower():
+        kwargs["thinking"] = {"type": "adaptive"}
+
+    t0 = time.perf_counter()
+    response = client.messages.parse(**kwargs)
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+
+    if scratchpad.is_active():
+        usage = getattr(response, "usage", None)
+        in_tok  = getattr(usage, "input_tokens", 0)  if usage else 0
+        out_tok = getattr(usage, "output_tokens", 0) if usage else 0
+        scratchpad.log_call(
+            role=role,
+            ticker=user_payload.get("ticker"),
+            model=MODEL,
+            payload=user_payload,
+            output=response.parsed_output,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            latency_ms=latency_ms,
+        )
     return response.parsed_output
 
 
@@ -354,10 +400,13 @@ def _fundamental_payload(ticker: str, feat_row, earnings_label: str, sector_rs: 
 
 
 def _sentiment_payload(ticker: str, feat_row, sig_row) -> dict:
+    ad = feat_row.get("ad_score_65")
     return {
         "ticker": ticker,
         "volume_today_vs_50d_avg": round(float(feat_row["volume"] / feat_row["vol_avg_50"]), 2)
             if feat_row.get("vol_avg_50") else None,
+        "ad_score_13w": round(float(ad), 2) if pd_notna(ad) else None,
+        "ad_grade_13w": ad_label(ad),
         "pocket_pivot_fired": bool(sig_row["pocket_pivot"]),
         "quiet_base_pre_breakout": bool(feat_row["atr_pct_prior"] <= feat_row["atr_pct_q35_120"])
             if pd_notna(feat_row.get("atr_pct_prior")) and pd_notna(feat_row.get("atr_pct_q35_120")) else None,
@@ -384,6 +433,7 @@ def _pm_payload(ticker: str, reports: dict, position_value_usd: float, total_por
                 trade_eligible: bool, research_report: dict | None = None) -> dict:
     payload = {
         "ticker": ticker,
+        "currently_held": position_value_usd > 0,
         "current_position_value_usd": round(position_value_usd, 2),
         "current_position_pct_of_portfolio": round(position_value_usd / total_portfolio_usd * 100, 2) if total_portfolio_usd > 0 else 0,
         "trade_eligible_account": trade_eligible,
@@ -408,6 +458,7 @@ def _pm_payload(ticker: str, reports: dict, position_value_usd: float, total_por
 
 def _minervini_payload(ticker, feat_row, sig_row, comp_row) -> dict:
     """Chart pattern + Stage 2 + RS + volume — Minervini's specific lens."""
+    ad = feat_row.get("ad_score_65")
     return {
         "ticker": ticker,
         "signals": {k: bool(sig_row[k]) for k in ("vcp", "momentum", "emergence", "pocket_pivot")},
@@ -418,6 +469,8 @@ def _minervini_payload(ticker, feat_row, sig_row, comp_row) -> dict:
         "pct_above_50_ema": round(float((feat_row["close"] - feat_row["ema_50"]) / feat_row["ema_50"] * 100), 1),
         "volume_x_vs_50d": round(float(feat_row["volume"] / feat_row["vol_avg_50"]), 2)
             if feat_row.get("vol_avg_50") else None,
+        "ad_score_13w": round(float(ad), 2) if pd_notna(ad) else None,
+        "ad_grade_13w": ad_label(ad),
         "atr_pct": round(float(feat_row["atr_pct"]) * 100, 2),
         "atr_pct_in_bottom_35_of_120d": bool(feat_row["atr_pct_prior"] <= feat_row["atr_pct_q35_120"])
             if pd_notna(feat_row.get("atr_pct_prior")) and pd_notna(feat_row.get("atr_pct_q35_120")) else None,
@@ -445,6 +498,7 @@ def _burry_payload(ticker, feat_row, close_series) -> dict:
         ret_30d = float(feat_row["close"] / close_series.iloc[-22] - 1) * 100
     else:
         ret_30d = None
+    ad = feat_row.get("ad_score_65")
     return {
         "ticker": ticker,
         "pct_above_50_ema": round(pct_above_50, 1),
@@ -454,6 +508,8 @@ def _burry_payload(ticker, feat_row, close_series) -> dict:
         "rs_line_at_new_high": bool(feat_row.get("rs_line_new_high", False)),
         "volume_x_vs_50d": round(float(feat_row["volume"] / feat_row["vol_avg_50"]), 2)
             if feat_row.get("vol_avg_50") else None,
+        "ad_score_13w": round(float(ad), 2) if pd_notna(ad) else None,
+        "ad_grade_13w": ad_label(ad),
         "atr_pct": round(float(feat_row["atr_pct"]) * 100, 2),
     }
 
@@ -493,35 +549,42 @@ def evaluate_full(ticker: str,
       macro_score: 0-100 from macro_gate.compute_regime() (for Druckenmiller)
       theme_tag: e.g. "AI infra" — applied as a soft category hint to Druckenmiller
     """
-    tech = _call_agent(SYSTEM_TECHNICAL, _technical_payload(ticker, feat_row, sig_row, comp_row), TechnicalReport)
-    fund = _call_agent(SYSTEM_FUNDAMENTAL, _fundamental_payload(ticker, feat_row, earnings_label, sector_rs), FundamentalReport)
-    sent = _call_agent(SYSTEM_SENTIMENT, _sentiment_payload(ticker, feat_row, sig_row), SentimentReport)
+    tech = _call_agent(SYSTEM_TECHNICAL, _technical_payload(ticker, feat_row, sig_row, comp_row),
+                       TechnicalReport, role="technical")
+    fund = _call_agent(SYSTEM_FUNDAMENTAL, _fundamental_payload(ticker, feat_row, earnings_label, sector_rs),
+                       FundamentalReport, role="fundamental")
+    sent = _call_agent(SYSTEM_SENTIMENT, _sentiment_payload(ticker, feat_row, sig_row),
+                       SentimentReport, role="sentiment")
     risk = _call_agent(SYSTEM_RISK, _risk_payload(ticker, position_value_usd, total_portfolio_usd,
-                                                  account_type, trade_eligible, ticker_in_locked), RiskReport)
+                                                  account_type, trade_eligible, ticker_in_locked),
+                       RiskReport, role="risk")
 
     reports = {"technical": tech, "fundamental": fund, "sentiment": sent, "risk": risk}
 
     if include_investor_agents:
         try:
-            minervini = _call_agent(SYSTEM_MINERVINI, _minervini_payload(ticker, feat_row, sig_row, comp_row), MinerviniReport)
+            minervini = _call_agent(SYSTEM_MINERVINI, _minervini_payload(ticker, feat_row, sig_row, comp_row),
+                                    MinerviniReport, role="minervini")
             reports["minervini"] = minervini
         except Exception as e:
             print(f"  ! minervini agent error: {e}")
         try:
-            drucken = _call_agent(SYSTEM_DRUCKENMILLER, _druckenmiller_payload(ticker, feat_row, sector_rs, theme_tag, macro_score), DruckenmillerReport)
+            drucken = _call_agent(SYSTEM_DRUCKENMILLER, _druckenmiller_payload(ticker, feat_row, sector_rs, theme_tag, macro_score),
+                                  DruckenmillerReport, role="druckenmiller")
             reports["druckenmiller"] = drucken
         except Exception as e:
             print(f"  ! druckenmiller agent error: {e}")
         if close_series is not None:
             try:
-                burry = _call_agent(SYSTEM_BURRY, _burry_payload(ticker, feat_row, close_series), BurryReport)
+                burry = _call_agent(SYSTEM_BURRY, _burry_payload(ticker, feat_row, close_series),
+                                    BurryReport, role="burry")
                 reports["burry"] = burry
             except Exception as e:
                 print(f"  ! burry agent error: {e}")
 
     pm = _call_agent(SYSTEM_PM, _pm_payload(ticker, reports, position_value_usd, total_portfolio_usd,
                                             trade_eligible, research_report=research_report),
-                     PortfolioManagerVerdict)
+                     PortfolioManagerVerdict, role="pm")
 
     return MultiAgentResult(
         ticker=ticker, technical=tech, fundamental=fund,

@@ -19,6 +19,15 @@ data/news/
 data/options/
 # data/multi_agent/ cached judgment results
 data/multi_agent/
+# data/backtest/ LB backtest results computed against user's holdings
+data/backtest/
+# data/scratchpad/ JSONL scratchpads of multi-agent calls — leaks holdings
+data/scratchpad/
+# data/ticker_analysis/ on-demand deep panel runs from the dashboard
+data/ticker_analysis/
+
+# Personal planning notes (contain portfolio sizes, holdings names)
+agentstock.md
 
 # Personal holdings — never commit
 holdings/

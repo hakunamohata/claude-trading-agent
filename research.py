@@ -47,7 +47,7 @@ class Source(BaseModel):
 
 class ResearchReport(BaseModel):
     catalyst_summary: str = Field(
-        max_length=600,
+        max_length=1200,
         description="2-3 sentences on the most material catalysts driving the stock in the last 30 days",
     )
     recent_developments: list[str] = Field(
@@ -56,8 +56,8 @@ class ResearchReport(BaseModel):
     )
     sentiment: Literal["bullish", "neutral", "bearish"]
     key_risks: str = Field(
-        max_length=400,
-        description="1-2 sentences on the specific risks/catalysts that could derail this thesis in the next 30 days",
+        max_length=1000,
+        description="1-3 sentences on the specific risks/catalysts that could derail this thesis in the next 30 days",
     )
     pending_catalysts: list[str] = Field(
         max_length=4,
@@ -160,22 +160,27 @@ def research_ticker(ticker: str, use_cache: bool = True,
         "Focus on material catalysts, not market commentary."
     )
 
-    response = client.messages.parse(
+    kwargs = dict(
         model=MODEL,
         max_tokens=4096,
-        thinking={"type": "adaptive"},
         system=[{
             "type": "text",
             "text": SYSTEM_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
         tools=[
-            {"type": "web_search_20260209", "name": "web_search"},
-            {"type": "web_fetch_20260209", "name": "web_fetch"},
+            # allowed_callers=["direct"] keeps the tools working on Haiku 4.5,
+            # which doesn't support programmatic tool calling (PTC).
+            {"type": "web_search_20260209", "name": "web_search", "allowed_callers": ["direct"]},
+            {"type": "web_fetch_20260209", "name": "web_fetch", "allowed_callers": ["direct"]},
         ],
         messages=[{"role": "user", "content": user_content}],
         output_format=ResearchReport,
     )
+    # Adaptive thinking only on Opus 4.6+ / Sonnet 4.6; skip on Haiku
+    if "haiku" not in MODEL.lower() and "sonnet-4-5" not in MODEL.lower():
+        kwargs["thinking"] = {"type": "adaptive"}
+    response = client.messages.parse(**kwargs)
 
     report = response.parsed_output
     save_research(ticker, report)
