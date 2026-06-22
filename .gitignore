@@ -4,6 +4,9 @@
 
 # User-specific config (holdings, account IDs, rules) — never commit
 user_config.py
+# Timestamped backups (created by sync-holdings) — also contain holdings data
+user_config.backup_*.py
+*.backup_*.xlsx
 
 # Data cache + scan/judgment outputs — all user-specific or large binaries
 data/*.parquet
@@ -42,3 +45,7 @@ venv/
 # IDE
 .vscode/
 .idea/
+
+# Project-scoped skills — user-local invocation playbooks
+.claude/skills/
+.claude/settings.local.json

@@ -320,6 +320,8 @@ page = st.sidebar.radio("Page", [
     "Today's Brief",
     "My Portfolio",
     "Ticker Analysis",
+    "Rationalization",
+    "Stops",
     "Today's Actions",
     "Trade Ticket",
     "Covered Calls",
@@ -1003,18 +1005,45 @@ elif page == "Chart Browser":
     ticker = st.selectbox("Ticker", tickers, index=default_ix)
     months = st.slider("Months of history", 3, 24, 6)
 
+    with st.expander("Chart overlays (external TA — Tier 3)", expanded=False):
+        col_t1, col_t2, col_t3 = st.columns(3)
+        with col_t1:
+            show_short_emas = st.checkbox("Short-term EMAs (8/20/55)", value=False,
+                help="Short-term trader EMA stack from external TA reference")
+            show_avwap = st.checkbox("AVWAP (from swing low)", value=True,
+                help="Anchored VWAP from rolling 60d swing low — institutional S/R per external TA reference")
+        with col_t2:
+            show_fib = st.checkbox("Fib retracements (38.2/50/61.8)", value=False,
+                help="Fib levels of the rolling 60d swing — pullback supports in uptrends")
+            show_demark = st.checkbox("DeMark 9 markers", value=True,
+                help="DeMark sequential setup count — marks ±9 exhaustion points")
+        with col_t3:
+            show_rsi_subplot = st.checkbox("RSI subplot (40/60 lines)", value=False,
+                help="Wilder RSI with uptrend-support / downtrend-resistance lines (40 / 60)")
+            show_new_modes = st.checkbox("AVWAP-reclaim + Fib-bounce signals", value=True,
+                help="Tier 2 external TA overlay modes — new signal markers alongside VCP/MOM/EME/PP")
+
     f = feats[ticker]
     s = sigs[ticker]
     window_start = latest_date - pd.DateOffset(months=months)
     fw = f[f.index >= window_start].copy()
     sw = s[s.index >= window_start].copy()
 
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.75, 0.25],
-        vertical_spacing=0.03,
-        subplot_titles=("Price + EMAs", "Volume"),
-    )
+    # Chart layout — RSI subplot adds a third row when toggled
+    if show_rsi_subplot:
+        fig = make_subplots(
+            rows=3, cols=1, shared_xaxes=True,
+            row_heights=[0.6, 0.2, 0.2],
+            vertical_spacing=0.03,
+            subplot_titles=("Price + EMAs", "Volume", "RSI (14)"),
+        )
+    else:
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            row_heights=[0.75, 0.25],
+            vertical_spacing=0.03,
+            subplot_titles=("Price + EMAs", "Volume"),
+        )
 
     fig.add_trace(go.Candlestick(
         x=fw.index, open=fw["open"], high=fw["high"], low=fw["low"], close=fw["close"],
@@ -1028,6 +1057,40 @@ elif page == "Chart Browser":
         x=fw.index, y=fw["ema_200"], name="200 EMA",
         line=dict(color="red", width=1.5),
     ), row=1, col=1)
+
+    # Short-term trader EMA stack (8 / 20 / 55) — display-only overlay
+    if show_short_emas and "ema_8" in fw.columns:
+        fig.add_trace(go.Scatter(
+            x=fw.index, y=fw["ema_8"], name="8 EMA",
+            line=dict(color="#2ecc71", width=1, dash="dot"),
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=fw.index, y=fw["ema_20"], name="20 EMA",
+            line=dict(color="#3498db", width=1, dash="dot"),
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=fw.index, y=fw["ema_55"], name="55 EMA",
+            line=dict(color="#c0392b", width=1, dash="dot"),
+        ), row=1, col=1)
+
+    # AVWAP from rolling swing low — "uncanny" S/R level per external TA reference
+    if show_avwap and "avwap_swinglow_60" in fw.columns:
+        fig.add_trace(go.Scatter(
+            x=fw.index, y=fw["avwap_swinglow_60"], name="AVWAP (60d swing low)",
+            line=dict(color="#8e44ad", width=2, dash="dash"),
+        ), row=1, col=1)
+
+    # Fibonacci retracement levels of the rolling 60d swing
+    if show_fib and "fib_382" in fw.columns:
+        for col, label, color in [
+            ("fib_382", "Fib 38.2%", "rgba(241,196,15,0.7)"),
+            ("fib_500", "Fib 50%", "rgba(230,126,34,0.7)"),
+            ("fib_618", "Fib 61.8%", "rgba(192,57,43,0.7)"),
+        ]:
+            fig.add_trace(go.Scatter(
+                x=fw.index, y=fw[col], name=label,
+                line=dict(color=color, width=1, dash="dot"),
+            ), row=1, col=1)
 
     # 9/21 SMA cloud — fill between
     if "sma_9" in fw.columns and "sma_21" in fw.columns:
@@ -1047,19 +1110,49 @@ elif page == "Chart Browser":
         ), row=1, col=1)
 
     # Signal markers — different shapes for each mode
-    for mode, color, label in [
-        ("vcp", "#1f77b4", "VCP"),
-        ("momentum", "#2ca02c", "MOM"),
-        ("emergence", "#9467bd", "EME"),
-        ("pocket_pivot", "#ff7f0e", "PP"),
-    ]:
+    mode_specs = [
+        ("vcp", "#1f77b4", "VCP", "triangle-up"),
+        ("momentum", "#2ca02c", "MOM", "triangle-up"),
+        ("emergence", "#9467bd", "EME", "triangle-up"),
+        ("pocket_pivot", "#ff7f0e", "PP", "triangle-up"),
+    ]
+    if show_new_modes:
+        mode_specs.extend([
+            ("avwap_reclaim", "#8e44ad", "AVWAP-R", "star"),
+            ("fib_bounce", "#d35400", "Fib-B", "diamond"),
+        ])
+    for mode, color, label, symbol in mode_specs:
+        if mode not in sw.columns:
+            continue
         sig_days = sw[sw[mode]]
         if not sig_days.empty:
             ys = fw.loc[sig_days.index, "low"] * 0.97
             fig.add_trace(go.Scatter(
                 x=sig_days.index, y=ys, mode="markers", name=label,
-                marker=dict(symbol="triangle-up", size=14, color=color,
+                marker=dict(symbol=symbol, size=14, color=color,
                             line=dict(width=1, color="black")),
+            ), row=1, col=1)
+
+    # DeMark 9 exhaustion markers — printed +9 (bullish exhaustion = potential top)
+    # or -9 (bearish exhaustion = potential bottom)
+    if show_demark and "demark_setup" in fw.columns:
+        d9 = fw[fw["demark_setup"] == 9]
+        dm9 = fw[fw["demark_setup"] == -9]
+        if not d9.empty:
+            fig.add_trace(go.Scatter(
+                x=d9.index, y=d9["high"] * 1.02, mode="markers+text",
+                name="DeMark +9 (top risk)",
+                marker=dict(symbol="x", size=12, color="#e74c3c", line=dict(width=2)),
+                text=["9"] * len(d9), textposition="top center",
+                textfont=dict(color="#e74c3c", size=10),
+            ), row=1, col=1)
+        if not dm9.empty:
+            fig.add_trace(go.Scatter(
+                x=dm9.index, y=dm9["low"] * 0.98, mode="markers+text",
+                name="DeMark -9 (bottom risk)",
+                marker=dict(symbol="x", size=12, color="#27ae60", line=dict(width=2)),
+                text=["9"] * len(dm9), textposition="bottom center",
+                textfont=dict(color="#27ae60", size=10),
             ), row=1, col=1)
 
     fig.add_trace(go.Bar(
@@ -1071,8 +1164,24 @@ elif page == "Chart Browser":
         line=dict(color="black", width=1, dash="dot"), showlegend=False,
     ), row=2, col=1)
 
+    # RSI subplot — 40 acts as uptrend-correction support, 60 as
+    # downtrend-bounce resistance (not the textbook 30/70 OB/OS)
+    if show_rsi_subplot and "rsi_14" in fw.columns:
+        fig.add_trace(go.Scatter(
+            x=fw.index, y=fw["rsi_14"], name="RSI(14)",
+            line=dict(color="#34495e", width=1.5), showlegend=False,
+        ), row=3, col=1)
+        for level, color, label in [
+            (60, "#e74c3c", "60 — downtrend resistance"),
+            (50, "#7f8c8d", "50 mid"),
+            (40, "#27ae60", "40 — uptrend support"),
+        ]:
+            fig.add_hline(y=level, line_dash="dash", line_color=color, line_width=1, row=3, col=1)
+        fig.update_yaxes(range=[0, 100], row=3, col=1)
+
+    chart_height = 850 if show_rsi_subplot else 700
     fig.update_layout(
-        height=700, xaxis_rangeslider_visible=False,
+        height=chart_height, xaxis_rangeslider_visible=False,
         margin=dict(l=10, r=10, t=40, b=10),
         legend=dict(orientation="h", y=1.02, x=0),
     )
@@ -1108,14 +1217,30 @@ elif page == "Chart Browser":
             ("MOM (Trend Continuation)", sig_row["momentum"]),
             ("EME (Stage-2 Emergence)", sig_row["emergence"]),
             ("PP  (Pocket Pivot)", sig_row["pocket_pivot"]),
+            ("AVWAP-R (Tier 2 — AVWAP reclaim)", sig_row.get("avwap_reclaim", False)),
+            ("Fib-B  (Tier 2 — Fib 38.2 bounce)", sig_row.get("fib_bounce", False)),
         ]
         for name, fired in modes_status:
             st.write(f"  [{'FIRED' if fired else '----'}]  {name}")
 
-        st.markdown("\n**Context**")
+        st.markdown("\n**Context (external TA overlays)**")
         rs_rank = feat_row.get("rs_rank")
         st.write(f"  RS rank (cross-sectional 1-99): "
                  f"**{int(rs_rank) if pd.notna(rs_rank) else 'n/a'}**")
+        rsi = feat_row.get("rsi_14")
+        if pd.notna(rsi):
+            zone = "uptrend support (~40)" if rsi <= 45 else ("downtrend resistance (~60)" if rsi >= 55 else "neutral")
+            st.write(f"  RSI(14): **{rsi:.1f}** ({zone})")
+        avwap = feat_row.get("avwap_swinglow_60")
+        close_now = feat_row["close"]
+        if pd.notna(avwap):
+            avwap_pos = "above" if close_now > avwap else "below"
+            pct = (close_now - avwap) / avwap * 100
+            st.write(f"  AVWAP (swing-low 60d): **${avwap:.2f}** — price is {avwap_pos} by {abs(pct):.1f}%")
+        demark = feat_row.get("demark_setup")
+        if pd.notna(demark) and demark != 0:
+            tag = " — POTENTIAL EXHAUSTION" if abs(demark) == 9 else ""
+            st.write(f"  DeMark setup count: **{int(demark):+d}**{tag}")
         st.write(f"  RS 60d vs QQQ: "
                  f"**{feat_row.get('rs_60_prior', float('nan'))*100:+.1f}%**")
         rs_line_nh = "YES" if feat_row.get("rs_line_new_high", False) else "no"
@@ -1417,6 +1542,43 @@ if page == "Trade Ticket":
         empty_hint="No trade ticket yet. Once `cc_income_engine.py` and `cc_buywrite.py` run, "
                    "a trade ticket can be drafted from their output.",
         command_hint="# Today's ticket lives at data/snapshots/<date>/trade_ticket.md",
+    )
+
+if page == "Rationalization":
+    _render_artifact_page(
+        title="Portfolio Rationalization",
+        filename="portfolio_rationalize.md",
+        empty_hint="No rationalization run yet. Synthesize one by asking for a keep/cut analysis.",
+        command_hint="# Lives at data/snapshots/<date>/portfolio_rationalize.md",
+    )
+
+# =============================================================
+# Stops — per-position sell-plan suggestions (external TA discipline)
+# =============================================================
+
+if page == "Stops":
+    st.title("Per-Position Stops")
+    st.caption("External TA sell-plan discipline. Tightest valid stop is "
+               "recommended; override per ticker as the chart suggests.")
+
+    col_r, col_d = st.columns([1, 5])
+    with col_r:
+        if st.button("🔄 Recompute"):
+            try:
+                import stops as stops_mod
+                stops_data = stops_mod.compute_all_stops()
+                stops_mod.save_stops_snapshot(stops_data)
+                st.success("Stops recomputed. Reloading...")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to recompute: {e}")
+
+    _render_artifact_page(
+        title="",
+        filename="stops.md",
+        empty_hint="No stops snapshot yet. Click 'Recompute' above to run stops.py.",
+        command_hint="# Lives at data/snapshots/<date>/stops.md — generate with `python stops.py`",
+        show_title=False,
     )
 
 # =============================================================

@@ -136,7 +136,7 @@ def get_news(ticker: str, force_refresh: bool = False) -> dict:
         "sentiment": summary.sentiment if summary else "neutral",
         "key_catalyst": summary.key_catalyst if summary else "none",
     }
-    cache_path.write_text(json.dumps(result, indent=2, default=str))
+    cache_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
     return result
 
 

@@ -79,7 +79,7 @@ DEFAULTS = {
     "dte_max":            50,
     "min_open_interest":  100,
     "max_spread_pct":     20.0,
-    "capacity_max_pct":   50.0,         # hard cap per ticker
+    "capacity_max_pct":   70.0,         # hard cap per ticker (raised 50->70 on 2026-06-21)
     "min_shares_per_100": 1,            # floor: need at least 1 contract of capacity after cap
     "max_per_ticker_share_pct": 40.0,   # no single ticker funds more than 40% of target (diversification)
 }
@@ -196,8 +196,8 @@ def build_inventory(only_tickers: set[str] | None = None) -> list[dict]:
         # there, that consumes 3 contracts of THAT account's capacity. We assume
         # CCs were written in the same account that has the most shares.
         cap_remaining_raw = max(0, cap_total - already)
-        cap_after_50 = int(cap_remaining_raw * DEFAULTS["capacity_max_pct"] / 100)
-        if cap_after_50 < DEFAULTS["min_shares_per_100"]:
+        cap_after_pct = int(cap_remaining_raw * DEFAULTS["capacity_max_pct"] / 100)
+        if cap_after_pct < DEFAULTS["min_shares_per_100"]:
             # Note it but skip recommendations
             out.append({
                 "ticker":          h["ticker"],
@@ -220,7 +220,7 @@ def build_inventory(only_tickers: set[str] | None = None) -> list[dict]:
             "shares":          shares,
             "contracts_total":     cap_total,
             "contracts_existing":  min(already, cap_total),
-            "contracts_available": cap_after_50,
+            "contracts_available": cap_after_pct,
             "lb_action":       lb.get("action"),
             "lb_score":        lb.get("score"),
             "lb_as_of":        lb.get("as_of"),

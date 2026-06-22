@@ -102,6 +102,116 @@ def compute_universe_rs_rank(
     return rank_df.round()
 
 
+# ---------- Tier 1: external TA overlays ----------
+
+def compute_anchored_vwap(df: pd.DataFrame, anchor_window: int = 60) -> pd.Series:
+    """Anchored VWAP from the most recent N-day swing low.
+
+    For each bar t, finds the index of the lowest low in (t - anchor_window, t]
+    and computes the cumulative volume-weighted typical price from that anchor
+    forward through t. As the anchor shifts (new swing low), AVWAP re-anchors.
+
+    Per external TA playbook: "uncanny" for support/resistance from key
+    inflection points. Use as a context feature and as the basis for the
+    `avwap_reclaim_signal` Tier 2 mode below.
+
+    No look-ahead: each row's AVWAP uses only bars from its anchor through t.
+    """
+    h, l, c = df["high"], df["low"], df["close"]
+    v = df["volume"]
+    typical = (h + l + c) / 3.0
+    tpv = typical * v
+
+    anchor_iloc = l.rolling(anchor_window, min_periods=1).apply(
+        lambda x: int(np.argmin(x.values)) + (len(x) - len(x.values)), raw=False
+    )
+
+    out = pd.Series(index=df.index, dtype="float64")
+    cum_tpv = tpv.cumsum().values
+    cum_v = v.cumsum().values
+    for i in range(len(df)):
+        win_start = max(0, i - anchor_window + 1)
+        anchor_local = int(np.argmin(l.iloc[win_start:i + 1].values))
+        anchor_i = win_start + anchor_local
+        if anchor_i == 0:
+            num = cum_tpv[i]
+            den = cum_v[i]
+        else:
+            num = cum_tpv[i] - cum_tpv[anchor_i - 1]
+            den = cum_v[i] - cum_v[anchor_i - 1]
+        out.iloc[i] = num / den if den > 0 else np.nan
+    return out
+
+
+def compute_demark_setup(c: pd.Series) -> pd.Series:
+    """DeMark 9 Sequential Setup count.
+
+    Positive count [+1..+9] = bullish setup (consecutive closes > close 4 bars ago).
+    Negative count [-1..-9] = bearish setup (consecutive closes < close 4 bars ago).
+    A printed +9 or -9 signals potential exhaustion — used for EXIT/trim timing,
+    not entry. Reset to 0 when the streak breaks.
+
+    Per external TA playbook: a DeMark 9 is worth monitoring, while a 13 is very rare.
+    """
+    diff = c - c.shift(4)
+    out = np.zeros(len(c), dtype=int)
+    for i in range(4, len(c)):
+        d = diff.iloc[i]
+        if pd.isna(d):
+            out[i] = 0
+        elif d > 0:
+            out[i] = (out[i - 1] + 1) if out[i - 1] > 0 else 1
+        elif d < 0:
+            out[i] = (out[i - 1] - 1) if out[i - 1] < 0 else -1
+        else:
+            out[i] = 0
+        if out[i] > 9:
+            out[i] = 9
+        if out[i] < -9:
+            out[i] = -9
+    return pd.Series(out, index=c.index)
+
+
+def compute_rsi(c: pd.Series, n: int = 14) -> pd.Series:
+    """Wilder's RSI (smoothed). Range [0, 100].
+
+    Per external TA playbook: in uptrends, **RSI 40 acts as support** during corrections;
+    in downtrends, **RSI 60 acts as resistance** during bounces. Watch reversals
+    around those lines, not the textbook 30/70 overbought/oversold.
+    """
+    delta = c.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    avg_up = up.ewm(alpha=1 / n, adjust=False).mean()
+    avg_down = down.ewm(alpha=1 / n, adjust=False).mean()
+    rs = avg_up / avg_down.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def compute_fib_levels(df: pd.DataFrame, window: int = 60) -> dict[str, pd.Series]:
+    """Fibonacci retracement levels of the rolling N-day swing.
+
+    Computes the highest high and lowest low over the prior `window` bars (as of
+    bar t, using shift(1) to avoid look-ahead). Returns the 38.2 / 50 / 61.8
+    retracement LEVELS of that swing.
+
+    Interpretation:
+        If price is in an uptrend (swing low first, then swing high), the
+        retracement levels are PULLBACK supports. If price holds 38.2% on a
+        pullback and reclaims, that's a Fib-bounce buy.
+    """
+    high_window = df["high"].rolling(window).max().shift(1)
+    low_window = df["low"].rolling(window).min().shift(1)
+    swing_range = high_window - low_window
+    return {
+        "fib_high_60": high_window,
+        "fib_low_60": low_window,
+        "fib_382": high_window - 0.382 * swing_range,
+        "fib_500": high_window - 0.500 * swing_range,
+        "fib_618": high_window - 0.618 * swing_range,
+    }
+
+
 def build_features(
     df: pd.DataFrame,
     benchmark_close: pd.Series,
@@ -120,6 +230,15 @@ def build_features(
     out["sma_9"] = c.rolling(9).mean()
     out["sma_21"] = c.rolling(21).mean()
     out["cloud_bullish"] = out["sma_9"] > out["sma_21"]
+
+    # Short-term trader EMA stack (8 / 20 / 55) — display-only context.
+    # The source playbook uses 200 SMA, but we already track 200 EMA which is close enough.
+    out["ema_8"] = ema(c, 8)
+    out["ema_20"] = ema(c, 20)
+    out["ema_55"] = ema(c, 55)
+
+    # Wilder's RSI for the 40/60 reversal levels.
+    out["rsi_14"] = compute_rsi(c, n=14)
     out["atr_14"] = atr(out, 14)
     out["atr_pct"] = out["atr_14"] / c
 
@@ -171,6 +290,29 @@ def build_features(
         out["rs_rank"] = rs_rank_series.reindex(out.index)
     else:
         out["rs_rank"] = pd.Series(index=out.index, dtype="float64")
+
+    # ---- Tier 1: external TA overlays (additive context) ----
+    out["avwap_swinglow_60"] = compute_anchored_vwap(out, anchor_window=60)
+    out["avwap_swinglow_60_prior"] = out["avwap_swinglow_60"].shift(1)
+    out["above_avwap"] = c > out["avwap_swinglow_60"]
+    # AVWAP reclaim today = was below AVWAP yesterday, above today
+    out["avwap_reclaim_today"] = (
+        (out["close_prior"] < out["avwap_swinglow_60_prior"])
+        & (c >= out["avwap_swinglow_60"])
+    )
+
+    out["demark_setup"] = compute_demark_setup(c)
+    out["demark_9_buy"] = out["demark_setup"] == 9   # bullish exhaustion (potential top)
+    out["demark_9_sell"] = out["demark_setup"] == -9  # bearish exhaustion (potential bottom)
+
+    fib = compute_fib_levels(out, window=60)
+    for k, v in fib.items():
+        out[k] = v
+    fib_tol = 0.02
+    out["near_fib_382"] = ((c - out["fib_382"]).abs() / c) <= fib_tol
+    out["near_fib_500"] = ((c - out["fib_500"]).abs() / c) <= fib_tol
+    out["near_fib_618"] = ((c - out["fib_618"]).abs() / c) <= fib_tol
+    out["above_fib_382"] = c > out["fib_382"]
 
     return out
 
@@ -321,16 +463,96 @@ def pocket_pivot_signal(feat: pd.DataFrame) -> pd.Series:
     )
 
 
+def avwap_reclaim_signal(feat: pd.DataFrame) -> pd.Series:
+    """Fifth mode (Tier 2 external TA overlay): close reclaims AVWAP from swing low.
+
+    Per external TA playbook: AVWAP from a key swing point is "uncanny" for S/R.
+    When price has been below the AVWAP and reclaims it on volume in a Stage-2
+    trend, that's institutional re-engagement.
+
+    Trigger:
+      - AVWAP reclaim today (close below AVWAP yesterday, above today)
+      - Stage 2 trend on prior bar (close > 50 EMA > 200 EMA)
+      - Volume >= 1.2x 50-day avg
+      - Top half of day's range
+      - 50 EMA rising (no failing trend)
+
+    Catches mean-reversion in Stage-2 trenders pulling back to AVWAP and
+    bouncing — a setup the VCP and PP modes both miss.
+    """
+    cond_reclaim = feat["avwap_reclaim_today"].fillna(False)
+    cond_stage2 = (
+        (feat["close_prior"] > feat["ema_50_prior"])
+        & (feat["ema_50_prior"] > feat["ema_200_prior"])
+    )
+    cond_volume = feat["volume"] >= 1.2 * feat["vol_avg_50"]
+    rng = (feat["high"] - feat["low"]).replace(0, np.nan)
+    cond_top_half = (feat["close"] - feat["low"]) / rng >= 0.5
+    cond_ema_rising = feat["ema_50_slope10"] > 0
+    return (
+        cond_reclaim
+        & cond_stage2
+        & cond_volume
+        & cond_top_half
+        & cond_ema_rising
+    )
+
+
+def fib_bounce_signal(feat: pd.DataFrame) -> pd.Series:
+    """Sixth mode (Tier 2 external TA overlay): bounce off a Fibonacci retracement level.
+
+    Per external TA playbook: "When different Fibonacci sub-divisions line up, you have
+    a very accurate target." Pullbacks that hold a Fib level and reclaim are
+    high-conviction entries because the level is a known institutional zone.
+
+    Trigger:
+      - Close was below the 38.2% retracement level yesterday, above today
+        (the bounce/reclaim event)
+      - 60-day swing range is meaningful (high > 1.05x low — avoid sideways grinds)
+      - Stage 2 trend on prior bar (uptrend context — don't catch falling knives)
+      - Volume >= 1.2x 50-day avg
+      - Top half close
+      - Close still well below the recent high (room to run; not extended)
+    """
+    c = feat["close"]
+    c_prior = feat["close_prior"]
+    fib_382 = feat["fib_382"]
+    fib_382_prior = fib_382.shift(1)
+
+    cond_reclaim_382 = (c_prior < fib_382_prior) & (c >= fib_382)
+    cond_meaningful_swing = feat["fib_high_60"] > 1.05 * feat["fib_low_60"]
+    cond_stage2 = (
+        (c_prior > feat["ema_50_prior"])
+        & (feat["ema_50_prior"] > feat["ema_200_prior"])
+    )
+    cond_volume = feat["volume"] >= 1.2 * feat["vol_avg_50"]
+    rng = (feat["high"] - feat["low"]).replace(0, np.nan)
+    cond_top_half = (c - feat["low"]) / rng >= 0.5
+    cond_not_extended = c <= 0.95 * feat["fib_high_60"]
+
+    return (
+        cond_reclaim_382
+        & cond_meaningful_swing
+        & cond_stage2
+        & cond_volume
+        & cond_top_half
+        & cond_not_extended
+    )
+
+
 def any_breakout_signal(feat: pd.DataFrame) -> pd.DataFrame:
     """Combined: returns DataFrame with all modes + `any` column."""
     vcp = breakout_signal(feat)
     mom = momentum_continuation_signal(feat)
     eme = stage_emergence_signal(feat)
     pp = pocket_pivot_signal(feat)
+    avwap = avwap_reclaim_signal(feat)
+    fib = fib_bounce_signal(feat)
     return pd.DataFrame(
         {
             "vcp": vcp, "momentum": mom, "emergence": eme, "pocket_pivot": pp,
-            "any": vcp | mom | eme | pp,
+            "avwap_reclaim": avwap, "fib_bounce": fib,
+            "any": vcp | mom | eme | pp | avwap | fib,
         },
         index=feat.index,
     )

@@ -92,23 +92,9 @@ def _get_client():
     return _client
 
 
-def _critique_one(ticker: str, records: list[dict]) -> CriticVerdict | None:
-    """Call the Critic on one ticker's records. Returns None if PM record missing."""
-    by_role: dict[str, dict] = {r["role"]: r for r in records if r["ticker"] == ticker}
-    if "pm" not in by_role:
-        return None
-
-    payload = {
-        "ticker": ticker,
-        "specialists": {
-            role: by_role[role]["output"]
-            for role in ("technical", "fundamental", "sentiment", "risk",
-                         "minervini", "druckenmiller", "burry")
-            if role in by_role
-        },
-        "lb_verdict": by_role["pm"]["output"],
-    }
-
+def _critic_call(payload: dict) -> CriticVerdict | None:
+    """Internal: send an already-assembled audit payload to Claude. Returns parsed
+    CriticVerdict. Logs to scratchpad if a run is active."""
     client = _get_client()
     user_content = f"Audit this ticker:\n{json.dumps(payload, indent=2, default=str)}"
     kwargs = dict(
@@ -131,12 +117,65 @@ def _critique_one(ticker: str, records: list[dict]) -> CriticVerdict | None:
         in_tok  = getattr(usage, "input_tokens", 0)  if usage else 0
         out_tok = getattr(usage, "output_tokens", 0) if usage else 0
         scratchpad.log_call(
-            role="critic", ticker=ticker, model=MODEL,
+            role="critic", ticker=payload.get("ticker", "?"), model=MODEL,
             payload=payload, output=response.parsed_output,
             input_tokens=in_tok, output_tokens=out_tok,
             latency_ms=latency_ms,
         )
     return response.parsed_output
+
+
+def critique_panel(result, position_context: dict | None = None) -> CriticVerdict | None:
+    """Critique a single-ticker MultiAgentResult directly. Use this from the
+    Ticker Analysis path (news_to_action.process_message) where the result is
+    in memory and no scratchpad run is required.
+
+    `result` is a multi_agent.MultiAgentResult instance.
+    `position_context` is optional — pass {"currently_held": bool,
+    "position_value_usd": float, "spot": float, "BofA_PO": float} to flag
+    common single-ticker traps (held vs unheld; price-vs-PO; etc.)."""
+    specialists = {
+        "technical":    result.technical.model_dump(),
+        "fundamental":  result.fundamental.model_dump(),
+        "sentiment":    result.sentiment.model_dump(),
+        "risk":         result.risk.model_dump(),
+    }
+    if result.minervini is not None:
+        specialists["minervini"]     = result.minervini.model_dump()
+    if result.druckenmiller is not None:
+        specialists["druckenmiller"] = result.druckenmiller.model_dump()
+    if result.burry is not None:
+        specialists["burry"]         = result.burry.model_dump()
+
+    payload = {
+        "ticker": result.ticker,
+        "specialists": specialists,
+        "lb_verdict": result.pm.model_dump(),
+    }
+    if position_context:
+        payload["position_context"] = position_context
+    return _critic_call(payload)
+
+
+def _critique_one(ticker: str, records: list[dict]) -> CriticVerdict | None:
+    """Call the Critic on one ticker's scratchpad records. Returns None if PM
+    record missing. Used by the batch CLI; new in-memory callers should use
+    critique_panel() instead."""
+    by_role: dict[str, dict] = {r["role"]: r for r in records if r["ticker"] == ticker}
+    if "pm" not in by_role:
+        return None
+
+    payload = {
+        "ticker": ticker,
+        "specialists": {
+            role: by_role[role]["output"]
+            for role in ("technical", "fundamental", "sentiment", "risk",
+                         "minervini", "druckenmiller", "burry")
+            if role in by_role
+        },
+        "lb_verdict": by_role["pm"]["output"],
+    }
+    return _critic_call(payload)
 
 
 def _find_run(kind: str, date: str | None = None) -> str:

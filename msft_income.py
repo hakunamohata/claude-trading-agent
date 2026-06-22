@@ -70,7 +70,7 @@ DEFAULTS = {
     "dte_max":            50,       # ~monthly cycle
     "min_open_interest":  100,      # filter illiquid strikes
     "max_spread_pct":     20.0,     # ask must be within 20% of mid
-    "capacity_max_pct":   50.0,     # HARD CAP — never recommend selling more than this share of available capacity
+    "capacity_max_pct":   70.0,     # HARD CAP — raised 50->70 on 2026-06-21 (covers rising margin interest)
 }
 
 

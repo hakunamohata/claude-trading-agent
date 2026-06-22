@@ -131,7 +131,7 @@ def load_cached(ticker: str, date: str | None = None) -> ResearchReport | None:
 
 def save_research(ticker: str, report: ResearchReport, date: str | None = None) -> None:
     p = _cache_path(ticker, date)
-    p.write_text(report.model_dump_json(indent=2))
+    p.write_text(report.model_dump_json(indent=2), encoding="utf-8")
 
 
 # ============================================================

@@ -71,7 +71,7 @@ def write_manifest(date: str | None = None, **extra: Any) -> Path:
     }
     manifest.update(extra)
     p = d / "manifest.json"
-    p.write_text(json.dumps(manifest, indent=2))
+    p.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return p
 
 
