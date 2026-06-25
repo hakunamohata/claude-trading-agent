@@ -120,13 +120,17 @@ def run(include_investor_agents: bool = False,
 
     # Macro regime is needed when investor agents are on (Druckenmiller uses it)
     macro_score = None
+    futures_lean = None
     if include_investor_agents:
         print("Computing macro regime...")
         try:
             from macro_gate import compute_regime
             regime = compute_regime()
             macro_score = regime.get("composite_score")
+            futures_lean = regime.get("futures")
             print(f"  Macro: {macro_score:.0f}/100 — {regime.get('regime_label', '?')}")
+            if futures_lean and futures_lean.get("nq_pct") is not None:
+                print(f"  Futures: {futures_lean['lean_note']}")
         except Exception as e:
             print(f"  ! macro regime failed: {e}")
 
@@ -207,6 +211,7 @@ def run(include_investor_agents: bool = False,
                 macro_score=macro_score,
                 theme_tag=theme_tag,
                 research_report=research_dict,
+                futures_lean=futures_lean,
             )
             results.append({
                 "ticker": t,

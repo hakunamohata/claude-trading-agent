@@ -477,9 +477,10 @@ def _minervini_payload(ticker, feat_row, sig_row, comp_row) -> dict:
     }
 
 
-def _druckenmiller_payload(ticker, feat_row, sector_rs, theme_tag, macro_score) -> dict:
+def _druckenmiller_payload(ticker, feat_row, sector_rs, theme_tag, macro_score,
+                           futures_lean: dict | None = None) -> dict:
     """Macro + sector + theme — Druckenmiller's big-picture lens."""
-    return {
+    payload = {
         "ticker": ticker,
         "macro_regime_score_0_100": macro_score,
         "sector_rs_vs_qqq_60d_pct": round(float(sector_rs), 1) if sector_rs is not None else None,
@@ -487,6 +488,14 @@ def _druckenmiller_payload(ticker, feat_row, sector_rs, theme_tag, macro_score) 
         "rs_rank_vs_peers_1_99": int(feat_row["rs_rank"]) if pd_notna(feat_row.get("rs_rank")) else None,
         "theme_tag": theme_tag,  # e.g. "AI infra", "memory super-cycle", "neutral"
     }
+    if futures_lean:
+        # Overnight bid for the next session — Druckenmiller cares about regime
+        # shifts intra-day vs cash close.
+        payload["overnight_futures_nq_pct"] = futures_lean.get("nq_pct")
+        payload["overnight_futures_es_pct"] = futures_lean.get("es_pct")
+        payload["overnight_futures_lean"] = futures_lean.get("lean")
+        payload["overnight_futures_note"] = futures_lean.get("lean_note")
+    return payload
 
 
 def _burry_payload(ticker, feat_row, close_series) -> dict:
@@ -540,7 +549,8 @@ def evaluate_full(ticker: str,
                   close_series=None,
                   macro_score: float | None = None,
                   theme_tag: str = "neutral",
-                  research_report: dict | None = None) -> MultiAgentResult:
+                  research_report: dict | None = None,
+                  futures_lean: dict | None = None) -> MultiAgentResult:
     """Run the 4 functional agents + PM. Optionally include 3 investor philosophy
     agents (Minervini, Druckenmiller, Burry) if include_investor_agents=True.
 
@@ -569,7 +579,8 @@ def evaluate_full(ticker: str,
         except Exception as e:
             print(f"  ! minervini agent error: {e}")
         try:
-            drucken = _call_agent(SYSTEM_DRUCKENMILLER, _druckenmiller_payload(ticker, feat_row, sector_rs, theme_tag, macro_score),
+            drucken = _call_agent(SYSTEM_DRUCKENMILLER,
+                                  _druckenmiller_payload(ticker, feat_row, sector_rs, theme_tag, macro_score, futures_lean),
                                   DruckenmillerReport, role="druckenmiller")
             reports["druckenmiller"] = drucken
         except Exception as e:

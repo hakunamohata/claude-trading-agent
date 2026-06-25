@@ -17,6 +17,7 @@ import pandas as pd
 
 from data_fetch import fetch_one, fetch_many
 from breakout import ema
+from futures import snapshot as futures_snapshot
 
 VIX_TICKER = "^VIX"
 CREDIT_TICKER = "HYG"      # iShares high-yield corporate bond
@@ -155,9 +156,17 @@ def compute_regime() -> dict:
     valid = [s for s in (vix_score, breadth_score, credit_score) if s is not None]
     composite = sum(valid) / len(valid) if valid else None
 
+    # Futures overnight (not scored into composite — purely informational for
+    # next-session positioning).
+    try:
+        fut = futures_snapshot()
+    except Exception:
+        fut = None
+
     return {
         "composite_score": round(composite, 1) if composite is not None else None,
         "regime_label": _regime_label(composite) if composite is not None else "unknown",
+        "futures": fut,
         "vix": {
             "value": vix_now,
             "score": vix_score,

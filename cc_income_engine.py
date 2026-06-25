@@ -58,7 +58,7 @@ except Exception:
 from data_fetch import DATA_DIR, fetch_many
 from options import fetch_expiries, fetch_options_chain, bs_greeks
 from breakout import build_features, ad_label
-from earnings import build_earnings_cache
+from earnings import build_earnings_cache, build_runup_cache, runup_risk_pct
 from msft_income import (
     EXPENSE_COMPONENTS,
     DEFAULTS as MSFT_DEFAULTS,
@@ -208,7 +208,7 @@ def build_inventory(only_tickers: set[str] | None = None) -> list[dict]:
                 "contracts_existing":  min(already, cap_total),
                 "contracts_available": 0,
                 "lb_action":       lb_actions.get((h["ticker"], _account_label(h["account_id"]).split()[0]), {}).get("action"),
-                "skipped_reason":  f"no capacity after 50% cap ({cap_remaining_raw} remaining)",
+                "skipped_reason":  f"no capacity after {DEFAULTS['capacity_max_pct']:.0f}% cap ({cap_remaining_raw} remaining)",
                 "locked":          h["ticker"] in locked,
             })
             continue
@@ -413,7 +413,8 @@ def _risk_verdict(adj: float, spans_earnings: bool) -> str:
 def gather_for_ticker(ticker: str, spot: float, dte_min: int, dte_max: int,
                       delta_min: float, delta_max: float,
                       technicals: dict | None = None,
-                      next_earnings: pd.Timestamp | None = None) -> list[dict]:
+                      next_earnings: pd.Timestamp | None = None,
+                      runup_df: pd.DataFrame | None = None) -> list[dict]:
     today = pd.Timestamp(date.today())
     try:
         expiries = fetch_expiries(ticker)
@@ -469,8 +470,19 @@ def gather_for_ticker(ticker: str, spot: float, dte_min: int, dte_max: int,
             adj, reasons = compute_risk_adjustment(tech, spans_earnings)
             adjusted_pop = max(0.0, min(100.0, c["pop_pct"] + adj))
 
+            # Pre-earnings runup risk — historical magnitude over the option's window
+            runup_peak_pct = None
+            runup_label = ""
+            if runup_df is not None and not runup_df.empty and next_earnings is not None:
+                try:
+                    days_to_er = int((pd.Timestamp(next_earnings) - today).days)
+                    runup_peak_pct, runup_label = runup_risk_pct(runup_df, ticker, days_to_er, dte)
+                except Exception:
+                    pass
+
             c.update({
                 "ticker":           ticker,
+                "spot":             spot,
                 "expiry":           exp,
                 "spans_earnings":   spans_earnings,
                 "next_earnings":    str(next_earnings.date()) if next_earnings is not None and not pd.isna(next_earnings) else None,
@@ -478,6 +490,8 @@ def gather_for_ticker(ticker: str, spot: float, dte_min: int, dte_max: int,
                 "adjusted_pop":     round(adjusted_pop, 1),
                 "risk_reasons":     reasons,
                 "risk_verdict":     _risk_verdict(adj, spans_earnings),
+                "runup_peak_pct":   runup_peak_pct,
+                "runup_label":      runup_label,
             })
             c["color"] = _color_adjusted(c)
             candidates.append(c)
@@ -577,6 +591,17 @@ def format_report(inventory: list[dict], mix: dict, spots: dict[str, float],
     lines.append(f"**Per-ticker capacity cap**: {DEFAULTS['capacity_max_pct']:.0f}% of available contracts")
     lines.append(f"**Per-ticker income cap**: {DEFAULTS['max_per_ticker_share_pct']:.0f}% of target (diversification)")
     lines.append("")
+
+    # Futures-aware premium banner
+    try:
+        from futures import cc_premium_tag, snapshot as _fut_snapshot
+        _fs = _fut_snapshot()
+        _tag, _note = cc_premium_tag(_fs)
+        if _tag:
+            lines.append(f"> **{_tag}** — {_note}")
+            lines.append("")
+    except Exception:
+        pass
     lines.append("Sized to cover annual obligations:")
     for label, amount in EXPENSE_COMPONENTS.items():
         lines.append(f"  - {label}: ${amount:,}")
@@ -592,8 +617,8 @@ def format_report(inventory: list[dict], mix: dict, spots: dict[str, float],
     if not sel:
         lines.append("_No GREEN candidates met criteria. Try widening `--delta-max` or `--dte-max`._")
     else:
-        lines.append("| Ticker | Account | Contracts | Strike | Expiry | Days to expiry | Delta | Probability of profit (Black-Scholes) | Probability of profit (adjusted) | Risk verdict | Premium per share | Cycle premium | Annualized premium | LB action |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        lines.append("| Ticker | Account | Contracts | Strike | Expiry | Days to expiry | Delta | Probability of profit (Black-Scholes) | Probability of profit (adjusted) | Risk verdict | Hist runup risk | Premium per share | Cycle premium | Annualized premium | LB action |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for s in sel:
             lb_tag = s.get("lb_action") or "—"
             if s["locked"]:
@@ -601,12 +626,23 @@ def format_report(inventory: list[dict], mix: dict, spots: dict[str, float],
             verdict_tag = s.get("risk_verdict", "—")
             if s.get("spans_earnings"):
                 verdict_tag += " 📅"
+            runup_peak = s.get("runup_peak_pct")
+            runup_label = s.get("runup_label") or ""
+            if runup_peak is not None:
+                cushion_pct = (s["strike"] - s["spot"]) / s["spot"] * 100 if "spot" in s else None
+                breach_tag = ""
+                if cushion_pct is not None and runup_peak > cushion_pct:
+                    breach_tag = " ⚠"
+                runup_cell = f"+{runup_peak:.1f}% peak{breach_tag}<br><small>{runup_label}</small>"
+            else:
+                runup_cell = runup_label or "—"
             lines.append(
                 f"| {s['ticker']} | {s['account_label'].split()[0]} | {s['contracts_chosen']} | "
                 f"${int(s['strike'])} | {s['expiry']} | {s['dte']} | "
                 f"{s['delta']:.2f} | {s['pop_pct']:.0f}% | "
                 f"{s.get('adjusted_pop', s['pop_pct']):.0f}% | "
                 f"{verdict_tag} | "
+                f"{runup_cell} | "
                 f"${s['mid']:.2f} | ${s['premium_this_cycle']:,.0f} | "
                 f"${s['annual_contribution']:,.0f} | {lb_tag} |"
             )
@@ -715,7 +751,7 @@ def format_report(inventory: list[dict], mix: dict, spots: dict[str, float],
         lines.append("")
 
     # --- Risk discipline reminder -----------------------------------------
-    lines.append("> **Risk discipline**: 50% per-ticker capacity cap. "
+    lines.append(f"> **Risk discipline**: {DEFAULTS['capacity_max_pct']:.0f}% per-ticker capacity cap. "
                  "Existing OPTIONS_POSITIONS in `user_config.py` are subtracted before applying the cap. "
                  "Locked positions (🔒) cannot be assigned — roll out and up when delta drifts above 0.40 with under 14 days to expiry.")
     return "\n".join(lines)
@@ -748,7 +784,7 @@ def run(target_annual_usd: float = DEFAULTS["target_annual_usd"],
         flag = " [LOCKED]" if r["locked"] else ""
         lb = r.get("lb_action") or "—"
         print(f"  {r['ticker']:6s} {r['account_label'].split()[0]:<12} "
-              f"shares={r['shares']:>6,} cap={r['contracts_available']} (after 50% + existing) "
+              f"shares={r['shares']:>6,} cap={r['contracts_available']} (after {DEFAULTS['capacity_max_pct']:.0f}% + existing) "
               f"LB={lb}{flag}")
 
     # Pre-load OHLCV and earnings cache for all eligible tickers in ONE batch.
@@ -759,6 +795,8 @@ def run(target_annual_usd: float = DEFAULTS["target_annual_usd"],
     bench = raw[BENCHMARK]["close"] if BENCHMARK in raw else None
     print("Building earnings cache...")
     earn_df = build_earnings_cache([r["ticker"] for r in eligible])
+    print("Building pre-earnings runup cache...")
+    runup_df = build_runup_cache([r["ticker"] for r in eligible])
 
     # Per-ticker technicals + earnings date (computed once, reused per candidate)
     tech_by_ticker: dict[str, dict] = {}
@@ -794,6 +832,7 @@ def run(target_annual_usd: float = DEFAULTS["target_annual_usd"],
                 t, spot, dte_min, dte_max, delta_min, delta_max,
                 technicals=tech_by_ticker.get(t),
                 next_earnings=next_earn_by_ticker.get(t),
+                runup_df=runup_df,
             )
         except Exception as e:
             print(f"    ! {t} gather failed: {e}")

@@ -322,6 +322,7 @@ page = st.sidebar.radio("Page", [
     "Ticker Analysis",
     "Rationalization",
     "Stops",
+    "Panel Runs",
     "Today's Actions",
     "Trade Ticket",
     "Covered Calls",
@@ -829,6 +830,30 @@ elif page == "Research Done":
 
 elif page == "Today's Brief":
     st.title(f"Today's Brief — {latest_date.date()}")
+
+    # Futures overnight banner
+    try:
+        from futures import snapshot as _fut_snapshot
+        _fs = _fut_snapshot()
+        if _fs.get("nq_pct") is not None:
+            _nq = _fs["nq_pct"]; _es = _fs["es_pct"]
+            _rty = _fs["data"].get("RTY=F", {}).get("pct")
+            _lean = _fs["lean"]
+            if _nq > 1.5: _fbg = "#1b4332"   # bull tilt
+            elif _nq > 0: _fbg = "#2d3748"   # mild
+            elif _nq > -1.5: _fbg = "#3a2d2d"  # mild down
+            else: _fbg = "#5c1f1f"            # bear
+            _rty_str = f" · RTY {_rty:+.2f}%" if _rty is not None else ""
+            st.markdown(
+                f"<div style='background-color:{_fbg};padding:8px 14px;border-radius:6px;margin-bottom:14px;'>"
+                f"<strong>Futures (overnight):</strong> NQ {_nq:+.2f}% · ES {_es:+.2f}%{_rty_str} "
+                f"— <em>{_lean.replace('-', ' ')}</em> "
+                f"<small>(regular session shows today's cash close; this is the overnight bid for next open)</small>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+    except Exception:
+        pass
 
     # Claude judgment session state
     if "claude_results" not in st.session_state:
@@ -1580,6 +1605,46 @@ if page == "Stops":
         command_hint="# Lives at data/snapshots/<date>/stops.md — generate with `python stops.py`",
         show_title=False,
     )
+
+# =============================================================
+# Panel Runs — multi-ticker 7-agent panel artifacts
+# =============================================================
+
+if page == "Panel Runs":
+    st.title("Panel Runs — multi-ticker 7-agent synthesis")
+    st.caption("Targeted runs that take a subset of names (e.g. day's hardest-hit cohort) "
+               "through the full 7-agent panel with optional external research context. "
+               "Each run is saved as a single .md per date.")
+
+    snap_root = Path("data/snapshots")
+    if not snap_root.exists():
+        st.info("No panel runs yet.")
+    else:
+        # Discover any panel-style file: hardest_hit_panel.md, *_runup_panel.md, *_panel.md
+        panel_files: list[tuple[str, str, Path]] = []  # (date, label, path)
+        for date_dir in sorted(snap_root.iterdir(), reverse=True):
+            if not date_dir.is_dir(): continue
+            for f in sorted(date_dir.glob("*_panel.md")):
+                label = f.stem.replace("_", " ").title()
+                panel_files.append((date_dir.name, label, f))
+
+        if not panel_files:
+            st.info(
+                "No panel runs yet. Run one of these to create a panel artifact:\n\n"
+                "```\n"
+                "python scripts/panel_hardest_hit.py    # 7-agent on day's worst movers\n"
+                "python scripts/msft_runup_panel.py     # 7-agent on MSFT pre-earnings runup\n"
+                "```"
+            )
+        else:
+            # Group by run type then by date
+            options = [f"{date} — {label}" for date, label, _ in panel_files]
+            picked = st.selectbox("Pick a panel run", options, index=0,
+                                  key="panel_run_select")
+            idx = options.index(picked)
+            date, label, path = panel_files[idx]
+            st.caption(f"_{path}_ — date {date}")
+            st.markdown(path.read_text(encoding="utf-8"))
 
 # =============================================================
 # Covered Calls — consolidated page (engines + per-ticker detail)

@@ -174,12 +174,24 @@ def lb_exit_trim_actions(judgments: list[dict], positions: pd.DataFrame,
                           options_tickers: set[str]) -> list[dict]:
     """Pull EXIT/TRIM verdicts from latest LB judgments."""
     actions = []
+    # Skip judgments for tickers no longer held (handles stale judgments after
+    # sells that pre-date the latest sync — e.g. COIN).
+    held_tickers = set(positions["ticker"].unique())
+    # Futures-aware: if NQ futures gap >+1.5%, append a defer-sells note to
+    # each EXIT/TRIM rationale so the user waits for the open.
+    try:
+        from futures import delay_sells_signal
+        defer, defer_reason = delay_sells_signal()
+    except Exception:
+        defer, defer_reason = False, ""
     for j in judgments:
         pm = j["result"]["pm"]
         action = pm["action"]
         if action not in ("EXIT", "TRIM"):
             continue
         ticker = j["ticker"]
+        if ticker not in held_tickers:
+            continue
         if ticker in LOCKED_POSITIONS:
             continue
         value = j["value"]
@@ -189,12 +201,13 @@ def lb_exit_trim_actions(judgments: list[dict], positions: pd.DataFrame,
             continue
         has_option = ticker in options_tickers
         sequence_note = " [SEQUENCE: close option first]" if has_option else ""
+        defer_note = f" [DEFER: {defer_reason}]" if defer else ""
         actions.append({
             "priority": 3 if action == "EXIT" else 4,
             "ticker": ticker,
             "verb": action,
             "rationale": (f"LB {pm['final_score']}/{confidence}/10: {pm['thesis']} "
-                          f"Position ${value:,.0f} ({j['pct_portfolio']:.1f}%).{sequence_note}"),
+                          f"Position ${value:,.0f} ({j['pct_portfolio']:.1f}%).{sequence_note}{defer_note}"),
             "account": _short_acct(j["account"]),
             "size_usd": value,
             "sizing_note": pm.get("sizing_note", ""),
@@ -428,6 +441,18 @@ def render_markdown(*, today: str, macro: dict | None, judgments_date: str | Non
         lines.append(f"**Macro:** {score:.0f}/100 — {label}\n")
     else:
         lines.append("**Macro:** (regime data unavailable)\n")
+
+    # Futures banner (overnight bid for next session)
+    fut = macro.get("futures") if macro else None
+    if fut and fut.get("nq_pct") is not None:
+        nq = fut["nq_pct"]
+        es = fut["es_pct"]
+        rty = fut["data"].get("RTY=F", {}).get("pct")
+        lean = fut["lean"]
+        # Highlight icon by lean
+        icon = "🟢" if (nq is not None and nq > 1.5) else ("🟡" if nq > 0 else "🔴")
+        rty_str = f" / RTY {rty:+.2f}%" if rty is not None else ""
+        lines.append(f"**Futures (overnight):** {icon} NQ {nq:+.2f}% / ES {es:+.2f}%{rty_str} — _{lean}_\n")
 
     # Data freshness
     bar_date = None
