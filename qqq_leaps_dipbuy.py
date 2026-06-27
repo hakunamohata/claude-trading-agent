@@ -54,6 +54,12 @@ DEFAULTS = {
     # Tuneable knob below.
     "backtest_qqq_win_threshold_pct": 15.0,
     "backtest_horizon_days":   365,
+    # ---- Position-size guards (consider existing open LEAPS before adding) ----
+    # Don't open a new LEAPS if any of these limits would be breached:
+    "max_concurrent_leaps":          3,    # absolute count cap across accounts
+    "dup_strike_window_pct":         3.0,  # skip if existing strike within ±X% of new pick's strike
+    "dup_expiry_window_days":        60,   # skip if existing expiry within ±N days of new pick's expiry
+    "max_total_capital_pct_of_port": 5.0,  # total cost basis of open LEAPS as % of portfolio
 }
 
 
@@ -260,6 +266,86 @@ def open_qqq_leaps() -> list[dict]:
 
 
 # ============================================================
+# Position-size guards
+# ============================================================
+
+def _portfolio_total_value() -> float | None:
+    """Sum of HOLDINGS_CURRENT values (positions, cash sleeves, mutual funds)."""
+    try:
+        import user_config
+    except Exception:
+        return None
+    total = 0.0
+    for row in getattr(user_config, "HOLDINGS_CURRENT", []):
+        try:
+            total += float(row[4])
+        except (IndexError, ValueError, TypeError):
+            continue
+    return total if total > 0 else None
+
+
+def evaluate_position_limits(leap_pick: dict, open_positions: list[dict]) -> dict:
+    """Check whether adding `leap_pick` would breach any position-size limit.
+
+    Returns dict with:
+      - ok: bool — True if all checks pass
+      - reasons: list[str] — human-readable reasons for any failures
+      - existing_count, existing_capital_usd, portfolio_total_usd, projected_capital_pct
+    """
+    reasons: list[str] = []
+
+    existing = [p for p in open_positions if not p.get("error")]
+    existing_count = len(existing)
+    existing_capital = sum(
+        float(p.get("cost_per_contract", 0)) * int(p.get("contracts", 0))
+        for p in existing
+    )
+
+    # 1) Absolute count cap
+    if existing_count >= DEFAULTS["max_concurrent_leaps"]:
+        reasons.append(
+            f"Already {existing_count} open LEAPS — cap is {DEFAULTS['max_concurrent_leaps']}"
+        )
+
+    # 2) Duplicate-strike / duplicate-expiry overlap
+    if leap_pick is not None:
+        new_strike = float(leap_pick["strike"])
+        new_expiry = pd.Timestamp(leap_pick["expiry"])
+        strike_tol = new_strike * DEFAULTS["dup_strike_window_pct"] / 100
+        expiry_tol = DEFAULTS["dup_expiry_window_days"]
+        for p in existing:
+            same_strike = abs(float(p["strike"]) - new_strike) <= strike_tol
+            same_expiry = abs((pd.Timestamp(p["expiry"]) - new_expiry).days) <= expiry_tol
+            if same_strike and same_expiry:
+                reasons.append(
+                    f"Would duplicate existing {int(p['strike'])}C {p['expiry']} "
+                    f"(within ±{DEFAULTS['dup_strike_window_pct']:.0f}% strike "
+                    f"and ±{DEFAULTS['dup_expiry_window_days']}d expiry)"
+                )
+
+    # 3) Capital cap
+    port_total = _portfolio_total_value()
+    new_cost = float(leap_pick["cost_per_contract"]) if leap_pick else 0
+    projected_capital = existing_capital + new_cost
+    projected_pct = (projected_capital / port_total * 100) if port_total else None
+    if projected_pct is not None and projected_pct > DEFAULTS["max_total_capital_pct_of_port"]:
+        reasons.append(
+            f"Adding would push total LEAPS capital to {projected_pct:.2f}% of portfolio "
+            f"(cap {DEFAULTS['max_total_capital_pct_of_port']:.1f}%); "
+            f"existing ${existing_capital:,.0f} + new ${new_cost:,.0f} on ${port_total:,.0f}"
+        )
+
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "existing_count": existing_count,
+        "existing_capital_usd": round(existing_capital, 0),
+        "portfolio_total_usd": round(port_total, 0) if port_total else None,
+        "projected_capital_pct": round(projected_pct, 2) if projected_pct is not None else None,
+    }
+
+
+# ============================================================
 # Backtest
 # ============================================================
 
@@ -340,7 +426,8 @@ def backtest(df: pd.DataFrame, years: int = 5,
 # ============================================================
 
 def format_report(signal_info: dict, leap_pick: dict | None,
-                  open_positions: list[dict], backtest_result: dict | None) -> str:
+                  open_positions: list[dict], backtest_result: dict | None,
+                  position_limits: dict | None = None) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
     lines = []
     lines.append(f"# QQQ LEAPS Dip-Buy — {today}")
@@ -367,10 +454,37 @@ def format_report(signal_info: dict, leap_pick: dict | None,
     lines.append(f"- Above 100-day average: {'✅ yes (bull regime)' if signal_info.get('cond_above_sma') else '❌ no (bear regime — skip)'}")
     lines.append("")
 
+    # ---- Position-size guards (gate before recommending) -------------------
+    if signal_info.get("signal") and leap_pick and position_limits:
+        if not position_limits["ok"]:
+            lines.append("## Recommended trade — ⚠ BLOCKED BY POSITION-SIZE GUARDS")
+            lines.append("")
+            lines.append("The signal fired, but adding this LEAPS would breach your size rules:")
+            for r in position_limits["reasons"]:
+                lines.append(f"- ❌ {r}")
+            lines.append("")
+            lines.append(f"Existing open LEAPS: {position_limits['existing_count']} "
+                         f"(${position_limits['existing_capital_usd']:,.0f} capital)")
+            if position_limits.get("portfolio_total_usd"):
+                lines.append(f"Portfolio total: ${position_limits['portfolio_total_usd']:,.0f}; "
+                             f"projected LEAPS allocation if added: "
+                             f"{position_limits.get('projected_capital_pct', 0):.2f}%")
+            lines.append("")
+            lines.append("> To override these guards, edit `qqq_leaps_dipbuy.py` DEFAULTS "
+                         "or close an existing LEAPS first.")
+            lines.append("")
+            # Skip the green trade card below
+            leap_pick = None  # type: ignore[assignment]
+
     # ---- Recommended trade card when signal fires --------------------------
     if signal_info.get("signal") and leap_pick:
         lines.append("## Recommended trade")
         lines.append("")
+        if position_limits:
+            lines.append(f"_Position-size check: ✅ OK — "
+                         f"{position_limits['existing_count']} open LEAPS, projected allocation "
+                         f"{position_limits.get('projected_capital_pct', 0):.2f}% of portfolio_")
+            lines.append("")
         lines.append(f"**Buy 1× QQQ {int(leap_pick['strike'])}C expiring {leap_pick['expiry']}** 🟢")
         lines.append("")
         lines.append(f"- Delta: {leap_pick['delta']:.2f}")
@@ -481,7 +595,15 @@ def run(do_backtest: bool = False, years: int = 5) -> dict:
         bt = backtest(df, years=years)
         print(f"  {bt['n_signals']} signals; {bt['n_wins']} wins ({bt['hit_rate_pct']:.0f}%)")
 
-    report = format_report(signal, leap, open_positions, bt)
+    # Position-size guard evaluation when signal fires
+    pos_limits = None
+    if signal.get("signal") and leap is not None:
+        pos_limits = evaluate_position_limits(leap, open_positions)
+        print(f"  Position-size guards: {'OK' if pos_limits['ok'] else 'BLOCKED'}")
+        for r in pos_limits.get("reasons", []):
+            print(f"    ! {r}")
+
+    report = format_report(signal, leap, open_positions, bt, pos_limits)
     today = datetime.now().strftime("%Y-%m-%d")
     out_dir = DATA_DIR / "snapshots" / today
     out_dir.mkdir(parents=True, exist_ok=True)

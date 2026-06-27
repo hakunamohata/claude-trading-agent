@@ -4,6 +4,8 @@
 
 # User-specific config (holdings, account IDs, rules) — never commit
 user_config.py
+# Account-ID mapping for the sync script — copy account_map.example.py to start
+account_map.py
 # Timestamped backups (created by sync-holdings) — also contain holdings data
 user_config.backup_*.py
 *.backup_*.xlsx
