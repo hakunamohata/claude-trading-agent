@@ -1,8 +1,25 @@
+# Core data + numerics
 yfinance>=0.2.40
 pandas>=2.2
 numpy>=1.26
+scipy>=1.13
 pyarrow>=15
+
+# Dashboard
 streamlit>=1.30
 plotly>=6
+
+# Anthropic API + structured outputs (multi-agent panel)
 anthropic>=0.42
+pydantic>=2.8
+pydantic-settings>=2.10
+jsonschema>=4.20
+
+# PDF ingestion (BofA reports, IO Fund PDFs)
+pymupdf4llm>=1.27
+PyMuPDF>=1.27
+
+# HTTP + utilities
+requests>=2.32
 python-dotenv>=1.0
+tabulate>=0.10
