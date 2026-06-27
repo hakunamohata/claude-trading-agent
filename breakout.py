@@ -542,17 +542,19 @@ def fib_bounce_signal(feat: pd.DataFrame) -> pd.Series:
 
 def any_breakout_signal(feat: pd.DataFrame) -> pd.DataFrame:
     """Combined: returns DataFrame with all modes + `any` column."""
+    from xtrender import xtrender_signal
     vcp = breakout_signal(feat)
     mom = momentum_continuation_signal(feat)
     eme = stage_emergence_signal(feat)
     pp = pocket_pivot_signal(feat)
     avwap = avwap_reclaim_signal(feat)
     fib = fib_bounce_signal(feat)
+    xtrend = xtrender_signal(feat)
     return pd.DataFrame(
         {
             "vcp": vcp, "momentum": mom, "emergence": eme, "pocket_pivot": pp,
-            "avwap_reclaim": avwap, "fib_bounce": fib,
-            "any": vcp | mom | eme | pp | avwap | fib,
+            "avwap_reclaim": avwap, "fib_bounce": fib, "xtrend": xtrend,
+            "any": vcp | mom | eme | pp | avwap | fib | xtrend,
         },
         index=feat.index,
     )
